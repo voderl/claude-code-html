@@ -4,6 +4,32 @@ import * as os from "os";
 import * as path from "path";
 
 /**
+ * Probe `tmux -V` once at startup. Returns { ok, message } so the CLI can
+ * print a clean message and exit 1 instead of unwinding a confusing
+ * spawnSync error from the middle of a capture loop.
+ */
+export function checkTmuxAvailable(): { ok: true } | { ok: false; message: string } {
+  const r = spawnSync("tmux", ["-V"], { encoding: "utf-8" });
+  if (r.error && (r.error as NodeJS.ErrnoException).code === "ENOENT") {
+    return {
+      ok: false,
+      message:
+        "tmux is not installed or not on PATH.\n" +
+        "  • macOS:  brew install tmux\n" +
+        "  • Debian/Ubuntu:  sudo apt install tmux\n" +
+        "  • Fedora/RHEL:  sudo dnf install tmux",
+    };
+  }
+  if (r.status !== 0) {
+    return {
+      ok: false,
+      message: `tmux -V failed (status ${r.status}): ${(r.stderr || r.stdout || "").trim() || "unknown error"}`,
+    };
+  }
+  return { ok: true };
+}
+
+/**
  * Thin wrapper around the `tmux` CLI that pins every call to a dedicated socket
  * (`-L <socket>`) so the tool runs on its own server, isolated from the user's
  * everyday tmux. That makes option overrides predictable and lets us reset the
@@ -101,6 +127,16 @@ export class Tmux {
     const args = ["capture-pane", "-p", "-S", "-", "-E", "-", "-t", name];
     if (withAnsi) args.push("-e");
     return this.run(args, { check: true }).stdout;
+  }
+
+  /**
+   * Read the pane title (the string the TUI most recently set via OSC 0/2,
+   * exposed as tmux's #{pane_title} format). Returns "" if unavailable.
+   */
+  paneTitle(name: string): string {
+    const r = this.run(["display-message", "-p", "-t", name, "#{pane_title}"]);
+    if (r.status !== 0) return "";
+    return r.stdout.replace(/\r?\n$/, "");
   }
 
   sendKeys(name: string, ...keys: string[]): void {

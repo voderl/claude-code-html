@@ -9,11 +9,11 @@ export interface Snapshot {
 
 export function ansiToHtml(ansi: string): string {
   const up = new AnsiUp();
-  // Inline styles — produces a single self-contained HTML with no CSS class deps.
+  // Inline styles — we class-ify them later in buildHtml.
   up.use_classes = false;
   // Strip leading/trailing blank lines that tmux pads to fill the visible pane,
   // but keep internal whitespace intact.
-  const stripped = ansi.replace(/^[\s ]*\n/g, "").replace(/[\s ]*\n*$/g, "\n");
+  const stripped = ansi.replace(/^[\s ]*\n/g, "").replace(/[\s ]*\n*$/g, "\n");
   // Strip OSC sequences (ESC ] ... ST). ansi_up only understands CSI/SGR, so
   // OSC 8 hyperlinks would otherwise leak their ]8;…\ body into the HTML as
   // garbage. Dropping the start/end markers preserves the anchor text between.
@@ -33,66 +33,152 @@ export function ansiToHtml(ansi: string): string {
 // Punctuation, Halfwidth and Fullwidth Forms. Each glyph occupies 2 terminal
 // cells, so in HTML we need to clamp its rendered width to 2ch to keep the
 // table borders (│ ─ etc.) aligned with the ASCII grid.
-const CJK_RE = /[⺀-⻿　-〿぀-ゟ゠-ヿ㐀-䶿一-鿿豈-﫿︰-﹏＀-￯]/g;
+const CJK_RUN_RE = /[⺀-⻿　-〿぀-ゟ゠-ヿ㐀-䶿一-鿿豈-﫿︰-﹏＀-￯]+/g;
 
 /**
  * Walk the ansi_up output, splitting it into HTML tags vs raw text, and wrap
- * every CJK code point in the text portions with <span class="cjk">…</span>.
- * The .cjk span gets width:2ch in CSS so each wide glyph takes exactly two
- * monospace cells, matching the terminal's cell grid.
+ * each *run* of consecutive CJK code points in a single
+ * <span class="cjk" style="width:Nch">…</span>, where N = 2 × char count.
+ * CSS justifies the run's content with text-align: justify +
+ * text-justify: inter-character, so every wide glyph still lands on a 2-cell
+ * boundary without paying the per-character span overhead.
  */
 export function wrapCJK(html: string): string {
   return html.replace(/(<[^>]+>)|([^<]+)/g, (_m, tag: string, text: string) => {
     if (tag) return tag;
-    return text.replace(CJK_RE, (c) => `<span class="cjk">${c}</span>`);
+    return text.replace(
+      CJK_RUN_RE,
+      (run) => `<span class="cjk" style="width:${run.length * 2}ch">${run}</span>`,
+    );
   });
+}
+
+/**
+ * Dedupe every `style="…"` attribute we encounter into a short CSS class, so
+ * thousands of repeated `<span style="color:rgb(…)">` shrink to `<span class="a">`.
+ * Names use a base-52/62 alphabet (single char for the first 52 unique styles,
+ * two chars for the next 3,224, etc.) to keep the per-span cost minimal.
+ */
+class StyleClassifier {
+  private map = new Map<string, string>();
+  private n = 0;
+
+  classify(html: string): string {
+    return html.replace(/<([a-zA-Z][\w-]*)([^>]*)>/g, (full, tag: string, attrs: string) => {
+      const styleMatch = attrs.match(/\sstyle="([^"]*)"/);
+      if (!styleMatch) return full;
+      const style = styleMatch[1];
+      let cls = this.map.get(style);
+      if (cls === undefined) {
+        cls = shortName(this.n++);
+        this.map.set(style, cls);
+      }
+      let rest = attrs.replace(/\sstyle="[^"]*"/, "");
+      const classMatch = rest.match(/\sclass="([^"]*)"/);
+      if (classMatch) {
+        rest = rest.replace(/\sclass="[^"]*"/, ` class="${classMatch[1]} ${cls}"`);
+      } else {
+        rest = ` class="${cls}"` + rest;
+      }
+      return `<${tag}${rest}>`;
+    });
+  }
+
+  cssRules(): string {
+    let css = "";
+    for (const [style, cls] of this.map) css += `.${cls}{${style}}`;
+    return css;
+  }
+}
+
+/**
+ * ansi_up emits one <span> per uncolored "token" even when consecutive tokens
+ * share the same SGR state, because the TUI usually wraps each word in its own
+ * \x1b[...m...\x1b[0m. After classify(), that shows up as `<span class="X">A</span>
+ * <span class="X">B</span>` pairs that round-trip to the same color. Merge any
+ * such adjacent pair into `<span class="X">A B</span>`. Iterate until fixed
+ * point so chains of N same-class spans collapse into one. Safe: we only merge
+ * across separators that contain no tags, so we never absorb nested markup.
+ *
+ * .cjk spans are exempt: their width class encodes the exact CJK char count of
+ * the wrapped run, so merging two `class="cjk l"` (width:2ch) spans across an
+ * intervening `17` would leave the merged span 2ch wide but 4 visual cells of
+ * content — the cjk box-drawing borders on later lines would then drift.
+ */
+function mergeAdjacentSpans(html: string): string {
+  const re = /<span class="([^"]+)">([^<]*)<\/span>([^<]*)<span class="\1">([^<]*)<\/span>/g;
+  let prev = "";
+  while (prev !== html) {
+    prev = html;
+    html = html.replace(re, (m, cls: string, a: string, sep: string, b: string) =>
+      /\bcjk\b/.test(cls) ? m : `<span class="${cls}">${a}${sep}${b}</span>`,
+    );
+  }
+  return html;
+}
+
+// Class identifiers must start with a letter (52 options) and may continue
+// with letters or digits (62 options).
+const LEAD = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const REST = LEAD + "0123456789";
+
+function shortName(n: number): string {
+  let len = 1;
+  let offset = 0;
+  let cap = LEAD.length;
+  while (n - offset >= cap) {
+    offset += cap;
+    len++;
+    cap = LEAD.length * Math.pow(REST.length, len - 1);
+  }
+  let m = n - offset;
+  let s = "";
+  for (let i = 0; i < len - 1; i++) {
+    s = REST[m % REST.length] + s;
+    m = Math.floor(m / REST.length);
+  }
+  return LEAD[m] + s;
 }
 
 export interface BuildHtmlOpts {
   sessionId: string;
   snapshots: Snapshot[];
   fontPx?: number; // base monospace font size
+  title?: string; // <title> (defaults to "Claude Code Session <sessionId>")
 }
 
 /**
  * Build a single HTML document where:
- *   - Each snapshot index becomes a wrapper <div class="snapshot">.
- *   - Within each snapshot, every width-bucket becomes a <pre>.
- *   - CSS media queries pick the right width-bucket based on viewport.
- *   - Pressing Ctrl+O in the page cycles the active snapshot.
+ *   - Inline styles from ansi_up are deduped into short CSS classes.
+ *   - Each width bucket lives inside its own <template data-w="N" data-cols="C">.
+ *     Templates are inert until cloned, so the browser does no layout work for
+ *     the buckets it isn't currently showing.
+ *   - JS picks the largest template whose data-w ≤ window.innerWidth and clones
+ *     its content into <div id="snap">. On resize it re-clones.
+ *   - Ctrl+O cycles the active .snapshot div within the cloned content. The
+ *     cycle index is preserved across resize-driven re-clones.
  */
 export function buildHtml(opts: BuildHtmlOpts): string {
   const { sessionId, snapshots } = opts;
   const fontPx = opts.fontPx ?? 14;
+  const title = (opts.title && opts.title.trim()) || `Claude Code Session ${sessionId}`;
 
   const widths = uniqSorted(snapshots.map((s) => s.width));
   const snapIdx = uniqSorted(snapshots.map((s) => s.index));
 
-  let body = "";
-  for (const idx of snapIdx) {
-    const cls = idx === snapIdx[0] ? "snapshot active" : "snapshot";
-    body += `<div class="${cls}" data-snapshot="${idx}">\n`;
-    for (const w of widths) {
+  const classifier = new StyleClassifier();
+  let templates = "";
+  for (const w of widths) {
+    const cols = snapshots.find((s) => s.width === w)?.cols ?? 0;
+    let inner = "";
+    for (const idx of snapIdx) {
       const snap = snapshots.find((s) => s.index === idx && s.width === w);
       if (!snap) continue;
-      body += `  <pre class="terminal width-${w}" data-cols="${snap.cols}">${snap.html}</pre>\n`;
+      const cls = idx === snapIdx[0] ? "snapshot active" : "snapshot";
+      const html = mergeAdjacentSpans(classifier.classify(snap.html));
+      inner += `<div class="${cls}" data-snapshot="${idx}"><pre class="terminal">${html}</pre></div>`;
     }
-    body += `</div>\n`;
-  }
-
-  let widthCss = "";
-  for (let i = 0; i < widths.length; i++) {
-    const w = widths[i];
-    const next = widths[i + 1];
-    if (i === 0 && widths.length === 1) {
-      widthCss += `.width-${w} { display: block; }\n`;
-    } else if (i === 0) {
-      widthCss += `@media (max-width: ${next - 1}px) { .snapshot.active .width-${w} { display: block; } }\n`;
-    } else if (next) {
-      widthCss += `@media (min-width: ${w}px) and (max-width: ${next - 1}px) { .snapshot.active .width-${w} { display: block; } }\n`;
-    } else {
-      widthCss += `@media (min-width: ${w}px) { .snapshot.active .width-${w} { display: block; } }\n`;
-    }
+    templates += `<template data-w="${w}" data-cols="${cols}">${inner}</template>\n`;
   }
 
   return `<!DOCTYPE html>
@@ -100,84 +186,90 @@ export function buildHtml(opts: BuildHtmlOpts): string {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Claude Code Session ${escapeHtml(sessionId)}</title>
+<title>${escapeHtml(title)}</title>
 <style>
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; background: #181818; }
-  body {
-    color: #e5e5e5;
-    /* ASCII chars use the mono stack; per-glyph fallback hands CJK to
-       PingFang (macOS) / Hiragino / Noto CJK as the browser walks the list.
-       Keeping the mono families first means ch resolves to the ASCII
-       advance, which the .cjk clamp below relies on. */
-    font-family: Menlo, Monaco, "SF Mono", SFMono-Regular, ui-monospace,
-                 Consolas, "Liberation Mono", "Courier New",
-                 "PingFang SC", "PingFang TC", "Hiragino Sans GB",
-                 "Heiti SC", "Microsoft YaHei", "Noto Sans CJK SC",
-                 monospace;
-    font-size: ${fontPx}px;
-    line-height: 1.4;
-    /* No horizontal padding: it would eat into the per-bucket width, making
-       the minimum-width breakpoint trigger overflow-x. Vertical padding only. */
-    padding: 16px 0 48px;
-    font-variant-ligatures: none;
-  }
-  .terminal {
-    white-space: pre;
-    margin: 0;
-    display: none;
-    overflow-x: auto;
-    tab-size: 4;
-  }
-  .snapshot { display: none; }
-  .snapshot.active { display: block; }
-  /* Wide East-Asian glyphs occupy 2 terminal cells. Clamp their advance to
-     exactly 2 ASCII cells (2ch resolves against the inherited mono font's '0')
-     so table borders (│ ─ ┌ ┐) keep their grid alignment. We do NOT override
-     font-family here — otherwise ch would resolve against the CJK font and
-     drift away from the ASCII grid. We must NOT set overflow:hidden either:
-     per CSS 2.1 §10.8.1, that flips the inline-block's baseline to the bottom
-     margin edge, dragging neighboring ASCII text down half a line. */
-  .cjk {
-    display: inline-block;
-    width: 2ch;
-    vertical-align: baseline;
-  }
-  .hint {
-    position: fixed;
-    bottom: 10px;
-    right: 12px;
-    font: 11px/1.4 ui-monospace, monospace;
-    color: #b0b0b0;
-    background: rgba(0,0,0,0.55);
-    border: 1px solid #333;
-    padding: 4px 8px;
-    border-radius: 4px;
-    user-select: none;
-    pointer-events: none;
-  }
-  .hint b { color: #fff; }
-${widthCss}</style>
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: #181818; }
+body {
+  color: #e5e5e5;
+  font-family: Menlo, Monaco, "SF Mono", SFMono-Regular, ui-monospace,
+               Consolas, "Liberation Mono", "Courier New",
+               "PingFang SC", "PingFang TC", "Hiragino Sans GB",
+               "Heiti SC", "Microsoft YaHei", "Noto Sans CJK SC",
+               monospace;
+  font-size: ${fontPx}px;
+  line-height: 1.4;
+  padding: 16px 0 48px;
+  font-variant-ligatures: none;
+}
+.terminal { white-space: pre; margin: 0; overflow-x: auto; tab-size: 4; }
+.snapshot { display: none; }
+.snapshot.active { display: block; }
+/* CJK runs render inside an inline-block whose width is class-driven
+   (.cjk picks up width:Nch from the deduped style classes). text-justify:
+   inter-character distributes the run across the 2N-cell slot so each glyph
+   lands on a 2-cell boundary without per-character span overhead. */
+.cjk {
+  display: inline-block;
+  text-align: justify;
+  text-align-last: justify;
+  text-justify: inter-character;
+  vertical-align: baseline;
+}
+.hint {
+  position: fixed; bottom: 10px; right: 12px;
+  font: 11px/1.4 ui-monospace, monospace;
+  color: #b0b0b0; background: rgba(0,0,0,0.55);
+  border: 1px solid #333; padding: 4px 8px; border-radius: 4px;
+  user-select: none; pointer-events: none;
+}
+.hint b { color: #fff; }
+${classifier.cssRules()}
+</style>
 </head>
 <body>
-${body}<div class="hint" id="ccs-hint"><b id="ccs-idx">${snapIdx[0]}</b>/${snapIdx[snapIdx.length - 1]} · <kbd>Ctrl</kbd>+<kbd>O</kbd> 切换</div>
+${templates}<div id="snap"></div>
+<div class="hint" id="ccs-hint"><b id="ccs-idx">${snapIdx[0]}</b>/${snapIdx[snapIdx.length - 1]} · <kbd>Ctrl</kbd>+<kbd>O</kbd> 切换</div>
 <script>
 (function () {
-  var snaps = Array.prototype.slice.call(document.querySelectorAll('.snapshot'));
+  var widths = ${JSON.stringify(widths)};
+  var snap = document.getElementById('snap');
   var idxEl = document.getElementById('ccs-idx');
-  if (snaps.length <= 1) {
-    var hint = document.getElementById('ccs-hint');
-    if (hint) hint.style.display = 'none';
-    return;
+  var hint = document.getElementById('ccs-hint');
+  var activeIdx = 0;
+  var curW = -1;
+  function pickW() {
+    var iw = window.innerWidth;
+    for (var i = widths.length - 1; i >= 0; i--) if (iw >= widths[i]) return widths[i];
+    return widths[0];
+  }
+  function render() {
+    var w = pickW();
+    if (w === curW) return;
+    curW = w;
+    var tpl = document.querySelector('template[data-w="' + w + '"]');
+    snap.textContent = '';
+    snap.appendChild(tpl.content.cloneNode(true));
+    apply();
+  }
+  function apply() {
+    var snaps = snap.querySelectorAll('.snapshot');
+    if (snaps.length <= 1 && hint) hint.style.display = 'none';
+    for (var i = 0; i < snaps.length; i++) {
+      if (i === activeIdx) snaps[i].classList.add('active');
+      else snaps[i].classList.remove('active');
+    }
+    if (idxEl && snaps[activeIdx]) idxEl.textContent = snaps[activeIdx].getAttribute('data-snapshot');
   }
   function cycle() {
-    var cur = snaps.findIndex(function (n) { return n.classList.contains('active'); });
-    var next = (cur + 1) % snaps.length;
-    snaps[cur].classList.remove('active');
-    snaps[next].classList.add('active');
-    if (idxEl) idxEl.textContent = snaps[next].getAttribute('data-snapshot');
+    var snaps = snap.querySelectorAll('.snapshot');
+    if (snaps.length <= 1) return;
+    activeIdx = (activeIdx + 1) % snaps.length;
+    apply();
   }
+  render();
+  window.addEventListener('resize', render);
   document.addEventListener('keydown', function (e) {
     if (e.ctrlKey && !e.metaKey && !e.altKey && (e.key === 'o' || e.key === 'O')) {
       e.preventDefault();
@@ -205,121 +297,4 @@ function escapeHtml(s: string): string {
       default: return "&#39;";
     }
   });
-}
-
-/**
- * Split into a directory of per-width HTML pages plus an iframe-routed entry.
- * Used when the inline-everything HTML would be too large for one file.
- */
-export interface SplitHtmlOpts {
-  sessionId: string;
-  snapshots: Snapshot[];
-  fontPx?: number;
-}
-
-export function buildSplitHtml(opts: SplitHtmlOpts): { index: string; files: Record<string, string> } {
-  const { sessionId, snapshots } = opts;
-  const fontPx = opts.fontPx ?? 14;
-  const widths = uniqSorted(snapshots.map((s) => s.width));
-  const snapIdx = uniqSorted(snapshots.map((s) => s.index));
-
-  const files: Record<string, string> = {};
-  for (const w of widths) {
-    let body = "";
-    for (const idx of snapIdx) {
-      const cls = idx === snapIdx[0] ? "snapshot active" : "snapshot";
-      const snap = snapshots.find((s) => s.width === w && s.index === idx);
-      if (!snap) continue;
-      body += `<div class="${cls}" data-snapshot="${idx}"><pre class="terminal" data-cols="${snap.cols}">${snap.html}</pre></div>\n`;
-    }
-    files[`w${w}.html`] = `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>${escapeHtml(sessionId)} @${w}</title>
-<style>
-:root { color-scheme: dark; }
-* { box-sizing: border-box; }
-html, body { margin: 0; padding: 0; background: #181818; }
-body { color: #e5e5e5; font-family: Menlo, Monaco, "SF Mono", SFMono-Regular, ui-monospace, Consolas, "Liberation Mono", "Courier New", "PingFang SC", "PingFang TC", "Hiragino Sans GB", "Heiti SC", "Microsoft YaHei", "Noto Sans CJK SC", monospace; font-size: ${fontPx}px; line-height: 1.4; padding: 16px 0; font-variant-ligatures: none; }
-.terminal { white-space: pre; margin: 0; overflow-x: auto; tab-size: 4; }
-.snapshot { display: none; } .snapshot.active { display: block; }
-.cjk { display: inline-block; width: 2ch; vertical-align: baseline; }
-</style></head><body>${body}<script>
-window.addEventListener('message', function (e) {
-  if (!e.data || e.data.type !== 'ccs-cycle') return;
-  var snaps = Array.prototype.slice.call(document.querySelectorAll('.snapshot'));
-  var cur = snaps.findIndex(function (n) { return n.classList.contains('active'); });
-  var next = (cur + 1) % snaps.length;
-  snaps[cur].classList.remove('active');
-  snaps[next].classList.add('active');
-  parent.postMessage({ type: 'ccs-snapshot', index: snaps[next].getAttribute('data-snapshot') }, '*');
-});
-</script></body></html>
-`;
-  }
-
-  let widthCss = "";
-  for (let i = 0; i < widths.length; i++) {
-    const w = widths[i];
-    const next = widths[i + 1];
-    const sel = `iframe[data-w="${w}"]`;
-    if (i === 0 && widths.length === 1) {
-      widthCss += `${sel} { display: block; }\n`;
-    } else if (i === 0) {
-      widthCss += `@media (max-width: ${next - 1}px) { ${sel} { display: block; } }\n`;
-    } else if (next) {
-      widthCss += `@media (min-width: ${w}px) and (max-width: ${next - 1}px) { ${sel} { display: block; } }\n`;
-    } else {
-      widthCss += `@media (min-width: ${w}px) { ${sel} { display: block; } }\n`;
-    }
-  }
-
-  let frames = "";
-  for (const w of widths) {
-    frames += `<iframe data-w="${w}" src="w${w}.html"></iframe>\n`;
-  }
-
-  const index = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Claude Code Session ${escapeHtml(sessionId)}</title>
-<style>
-  :root { color-scheme: dark; }
-  html, body { margin: 0; padding: 0; background: #181818; height: 100%; }
-  iframe { display: none; border: 0; width: 100%; height: 100vh; background: #181818; }
-  ${widthCss}
-  .hint { position: fixed; bottom: 10px; right: 12px; font: 11px/1.4 ui-monospace, monospace; color: #b0b0b0; background: rgba(0,0,0,0.55); border: 1px solid #333; padding: 4px 8px; border-radius: 4px; }
-</style>
-</head>
-<body>
-${frames}<div class="hint" id="ccs-hint"><b id="ccs-idx">${snapIdx[0]}</b>/${snapIdx[snapIdx.length - 1]} · <kbd>Ctrl</kbd>+<kbd>O</kbd> 切换</div>
-<script>
-(function () {
-  var frames = Array.prototype.slice.call(document.querySelectorAll('iframe'));
-  var idxEl = document.getElementById('ccs-idx');
-  function activeFrame() {
-    return frames.find(function (f) { return getComputedStyle(f).display !== 'none'; });
-  }
-  document.addEventListener('keydown', function (e) {
-    if (e.ctrlKey && !e.metaKey && !e.altKey && (e.key === 'o' || e.key === 'O')) {
-      e.preventDefault();
-      var f = activeFrame();
-      if (f && f.contentWindow) f.contentWindow.postMessage({ type: 'ccs-cycle' }, '*');
-    }
-  });
-  window.addEventListener('message', function (e) {
-    if (!e.data || e.data.type !== 'ccs-snapshot') return;
-    if (idxEl) idxEl.textContent = e.data.index;
-    // Mirror across other frames so re-flowing keeps the same snapshot active.
-    frames.forEach(function (f) {
-      if (!f.contentWindow) return;
-      // No-op; mirroring optional. Could implement set-index if needed.
-    });
-  });
-})();
-</script>
-</body>
-</html>
-`;
-  return { index, files };
 }

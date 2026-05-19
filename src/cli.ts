@@ -1,13 +1,11 @@
 #!/usr/bin/env node
 import * as fs from "fs";
-import * as path from "path";
 import { Command } from "commander";
-import { Tmux, waitForStable, sleep } from "./tmux";
+import { Tmux, waitForStable, checkTmuxAvailable } from "./tmux";
 import {
   Snapshot,
   ansiToHtml,
   buildHtml,
-  buildSplitHtml,
 } from "./render";
 
 interface WidthSpec {
@@ -45,7 +43,7 @@ async function captureWidth(opts: {
   claudeBin: string;
   cwd: string;
   log: (s: string) => void;
-}): Promise<Snapshot[]> {
+}): Promise<{ snapshots: Snapshot[]; paneTitle: string }> {
   const name = sessionName(opts.sessionId, opts.spec.px);
   if (opts.tmux.hasSession(name)) opts.tmux.killSession(name);
 
@@ -68,6 +66,7 @@ async function captureWidth(opts: {
   });
 
   const out: Snapshot[] = [];
+  let paneTitle = "";
   try {
     opts.log(`[w=${opts.spec.px}] waiting for initial render to settle...`);
     await waitForStable(opts.tmux, name, {
@@ -90,15 +89,25 @@ async function captureWidth(opts: {
       index: 0,
       html: ansiToHtml(opts.tmux.capturePane(name, true)),
     });
+    paneTitle = opts.tmux.paneTitle(name);
 
     for (let i = 1; i < opts.snapshots; i++) {
+      // Claude's "detailed transcript" view: Ctrl+O toggles the transcript and
+      // Ctrl+E expands it to show all entries. We want the fully-expanded view,
+      // so send both in sequence, waiting for the pane to settle between them.
       opts.tmux.sendKeys(name, "C-o");
       await waitForStable(opts.tmux, name, {
         stableMs: opts.stableMs,
         pollMs: opts.pollMs,
         maxWaitMs: opts.maxWaitMs,
       });
-      opts.log(`[w=${opts.spec.px}] capturing snapshot ${i} (post-Ctrl+O #${i})`);
+      opts.tmux.sendKeys(name, "C-e");
+      await waitForStable(opts.tmux, name, {
+        stableMs: opts.stableMs,
+        pollMs: opts.pollMs,
+        maxWaitMs: opts.maxWaitMs,
+      });
+      opts.log(`[w=${opts.spec.px}] capturing snapshot ${i} (post-Ctrl+O+Ctrl+E #${i})`);
       const html = ansiToHtml(opts.tmux.capturePane(name, true));
       const prev = out[out.length - 1];
       if (prev && prev.html === html) {
@@ -115,7 +124,7 @@ async function captureWidth(opts: {
   } finally {
     if (opts.tmux.hasSession(name)) opts.tmux.killSession(name);
   }
-  return out;
+  return { snapshots: out, paneTitle };
 }
 
 async function main() {
@@ -137,11 +146,6 @@ async function main() {
     .option("--max-wait-ms <n>", "max wait per stable cycle", "20000")
     .option("--poll-ms <n>", "poll interval", "250")
     .option("--font-px <n>", "rendered font-size in HTML", "14")
-    .option(
-      "--split-bytes <n>",
-      "force split-to-directory above this html size in bytes",
-      String(2 * 1024 * 1024)
-    )
     .option("--claude <bin>", "claude binary", "claude")
     .option("--cwd <dir>", "working directory for the tmux process", process.cwd())
     .option("--history-limit <n>", "tmux history-limit (lines of scrollback)", "1000000")
@@ -159,13 +163,18 @@ async function main() {
     maxWaitMs: string;
     pollMs: string;
     fontPx: string;
-    splitBytes: string;
     claude: string;
     cwd: string;
     historyLimit: string;
     socket: string;
     quiet?: boolean;
   }>();
+
+  const tmuxCheck = checkTmuxAvailable();
+  if (!tmuxCheck.ok) {
+    console.error(`[claude-code-share] ${tmuxCheck.message}`);
+    process.exit(1);
+  }
 
   const sessionId = program.args[0];
   const log = opts.quiet ? () => {} : (s: string) => console.error(s);
@@ -176,9 +185,10 @@ async function main() {
   tmux.setupServer(parseInt(opts.historyLimit, 10));
 
   const all: Snapshot[] = [];
+  let title = "";
   try {
     for (const spec of widths) {
-      const snaps = await captureWidth({
+      const result = await captureWidth({
         tmux,
         sessionId,
         spec,
@@ -190,7 +200,8 @@ async function main() {
         cwd: opts.cwd,
         log,
       });
-      all.push(...snaps);
+      all.push(...result.snapshots);
+      if (!title && result.paneTitle) title = result.paneTitle;
     }
   } finally {
     // Tear down our private server so we don't leave it lingering.
@@ -207,35 +218,12 @@ async function main() {
     sessionId,
     snapshots: all,
     fontPx: parseInt(opts.fontPx, 10),
+    title,
   });
 
-  const limit = parseInt(opts.splitBytes, 10);
-  const outPath = opts.out;
-  const outIsDir = outPath.endsWith("/") || outPath.endsWith(path.sep);
-
-  if (Buffer.byteLength(html, "utf-8") <= limit && !outIsDir) {
-    fs.writeFileSync(outPath, html);
-    log(
-      `[claude-code-share] wrote ${outPath} (${(Buffer.byteLength(html, "utf-8") / 1024).toFixed(1)} KB, ${all.length} snapshots)`
-    );
-    return;
-  }
-
-  const dir = outIsDir
-    ? outPath
-    : outPath.replace(/\.html?$/i, "") || "session";
-  fs.mkdirSync(dir, { recursive: true });
-  const split = buildSplitHtml({
-    sessionId,
-    snapshots: all,
-    fontPx: parseInt(opts.fontPx, 10),
-  });
-  fs.writeFileSync(path.join(dir, "index.html"), split.index);
-  for (const [name, content] of Object.entries(split.files)) {
-    fs.writeFileSync(path.join(dir, name), content);
-  }
+  fs.writeFileSync(opts.out, html);
   log(
-    `[claude-code-share] wrote ${dir}/ (split mode, ${Object.keys(split.files).length + 1} files, ${all.length} snapshots)`
+    `[claude-code-share] wrote ${opts.out} (${(Buffer.byteLength(html, "utf-8") / 1024).toFixed(1)} KB, ${all.length} snapshots)`
   );
 }
 
