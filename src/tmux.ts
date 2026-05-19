@@ -1,0 +1,141 @@
+import { spawnSync, SpawnSyncReturns } from "child_process";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
+
+/**
+ * Thin wrapper around the `tmux` CLI that pins every call to a dedicated socket
+ * (`-L <socket>`) so the tool runs on its own server, isolated from the user's
+ * everyday tmux. That makes option overrides predictable and lets us reset the
+ * world by killing only our own server.
+ */
+export class Tmux {
+  private configFile: string | null = null;
+
+  constructor(public readonly socket: string) {}
+
+  private run(args: string[], opts: { check?: boolean; env?: Record<string, string> } = {}): SpawnSyncReturns<string> {
+    const prefix = ["-L", this.socket];
+    if (this.configFile) prefix.push("-f", this.configFile);
+    const result = spawnSync("tmux", [...prefix, ...args], {
+      encoding: "utf-8",
+      env: { ...process.env, ...(opts.env || {}) },
+    });
+    if (opts.check && result.status !== 0) {
+      throw new Error(
+        `tmux ${prefix.join(" ")} ${args.join(" ")} failed (${result.status}): ${result.stderr || result.stdout}`
+      );
+    }
+    return result;
+  }
+
+  hasSession(name: string): boolean {
+    return this.run(["has-session", "-t", name]).status === 0;
+  }
+
+  killSession(name: string): void {
+    this.run(["kill-session", "-t", name]);
+  }
+
+  killServer(): void {
+    this.run(["kill-server"]);
+  }
+
+  /**
+   * Write a tmux config file and have every subsequent invocation pass it via
+   * `-f`. tmux reads -f only when the server first starts, so the options take
+   * effect on first `new-session` and persist for the server's lifetime.
+   */
+  setupServer(historyLimit: number): void {
+    const conf = [
+      `set-option -g history-limit ${historyLimit}`,
+      // TUIs go through the normal screen so their output ends up in scrollback.
+      `set-window-option -g alternate-screen off`,
+      // Suppress claude's "tmux focus-events off · add 'set -g focus-events on'" advice.
+      `set-option -g focus-events on`,
+      // No bells / activity flashes / status bar — they steal rows or paint
+      // foreign chrome into the captured pane.
+      `set-option -g bell-action none`,
+      `set-option -g visual-bell off`,
+      `set-option -g visual-activity off`,
+      `set-option -g status off`,
+      // Permit fancy 24-bit color reporting.
+      `set-option -ga terminal-overrides ",*256col*:Tc"`,
+    ].join("\n") + "\n";
+    const file = path.join(os.tmpdir(), `claude-code-share-${process.pid}-${Date.now()}.tmux.conf`);
+    fs.writeFileSync(file, conf, { mode: 0o600 });
+    this.configFile = file;
+  }
+
+  cleanupConfig(): void {
+    if (this.configFile) {
+      try { fs.unlinkSync(this.configFile); } catch {}
+      this.configFile = null;
+    }
+  }
+
+  newDetachedSession(opts: {
+    name: string;
+    cols: number;
+    rows: number;
+    cwd?: string;
+    command: string[];
+    env?: Record<string, string>;
+  }): void {
+    const args = [
+      "new-session",
+      "-d",
+      "-s",
+      opts.name,
+      "-x",
+      String(opts.cols),
+      "-y",
+      String(opts.rows),
+    ];
+    if (opts.cwd) args.push("-c", opts.cwd);
+    args.push(...opts.command);
+    this.run(args, { check: true, env: opts.env });
+  }
+
+  capturePane(name: string, withAnsi: boolean): string {
+    const args = ["capture-pane", "-p", "-S", "-", "-E", "-", "-t", name];
+    if (withAnsi) args.push("-e");
+    return this.run(args, { check: true }).stdout;
+  }
+
+  sendKeys(name: string, ...keys: string[]): void {
+    this.run(["send-keys", "-t", name, ...keys], { check: true });
+  }
+}
+
+export function sleep(ms: number): Promise<void> {
+  return new Promise((res) => setTimeout(res, ms));
+}
+
+export interface WaitOpts {
+  stableMs: number;
+  pollMs: number;
+  maxWaitMs: number;
+}
+
+/**
+ * Poll capture-pane until the content stops changing for `stableMs`, or until
+ * `maxWaitMs` elapses. Uses plain (non-ANSI) capture for the diff so SGR noise
+ * doesn't keep resetting the timer.
+ */
+export async function waitForStable(tmux: Tmux, name: string, opts: WaitOpts): Promise<void> {
+  const start = Date.now();
+  let last = "";
+  let stableSince = 0;
+  while (Date.now() - start < opts.maxWaitMs) {
+    const cur = tmux.capturePane(name, false);
+    if (cur === last && cur.trim().length > 0) {
+      if (stableSince === 0) stableSince = Date.now();
+      if (Date.now() - stableSince >= opts.stableMs) return;
+    } else {
+      stableSince = 0;
+      last = cur;
+    }
+    await sleep(opts.pollMs);
+  }
+}
