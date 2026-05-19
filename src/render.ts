@@ -40,8 +40,9 @@ const CJK_RUN_RE = /[⺀-⻿　-〿぀-ゟ゠-ヿ㐀-䶿一-鿿豈-﫿︰-﹏＀
  * each *run* of consecutive CJK code points in a single
  * <span class="cjk" style="width:Nch">…</span>, where N = 2 × char count.
  * CSS justifies the run's content with text-align: justify +
- * text-justify: inter-character, so every wide glyph still lands on a 2-cell
- * boundary without paying the per-character span overhead.
+ * text-justify: inter-character (plus 2px horizontal padding to keep short
+ * runs from glueing to the box edges), so every wide glyph still lands inside
+ * its 2-cell slot without paying the per-character span overhead.
  */
 export function wrapCJK(html: string): string {
   return html.replace(/(<[^>]+>)|([^<]+)/g, (_m, tag: string, text: string) => {
@@ -199,8 +200,8 @@ body {
                "Heiti SC", "Microsoft YaHei", "Noto Sans CJK SC",
                monospace;
   font-size: ${fontPx}px;
-  line-height: 1.4;
-  padding: 16px 0 48px;
+  line-height: 1.3;
+  padding: 16px 12px 32px;
   font-variant-ligatures: none;
 }
 .terminal { white-space: pre; margin: 0; overflow-x: auto; tab-size: 4; }
@@ -208,13 +209,17 @@ body {
 .snapshot.active { display: block; }
 /* CJK runs render inside an inline-block whose width is class-driven
    (.cjk picks up width:Nch from the deduped style classes). text-justify:
-   inter-character distributes the run across the 2N-cell slot so each glyph
-   lands on a 2-cell boundary without per-character span overhead. */
+   inter-character distributes the run across the slot. The 2px horizontal
+   padding (eaten out of the outer width by the global box-sizing: border-box,
+   so the cell-aligned outer width is preserved) reserves a small edge gutter
+   so short runs — especially N=2 where justify would otherwise dump all slack
+   into the single inter-char gap — don't glue their glyphs to the box edges. */
 .cjk {
   display: inline-block;
   text-align: justify;
   text-align-last: justify;
   text-justify: inter-character;
+  padding: 0 2px;
   vertical-align: baseline;
 }
 .hint {
