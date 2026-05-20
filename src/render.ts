@@ -141,6 +141,179 @@ function shortName(n: number): string {
   return LEAD[m] + s;
 }
 
+/**
+ * After ansi_up + classify + merge, spans can still cross `\n` boundaries
+ * because tmux paints contiguous background runs (e.g. the prompt strip) across
+ * the trailing newline. Close every open span before a newline and reopen them
+ * after, so each source line is self-contained — that lets the tool-call
+ * segmenter slice on `\n` without re-balancing tags.
+ */
+export function splitSpansAtNewlines(html: string): string {
+  const out: string[] = [];
+  const stack: string[] = [];
+  let i = 0;
+  while (i < html.length) {
+    const ch = html[i];
+    if (ch === "<") {
+      const end = html.indexOf(">", i);
+      if (end < 0) {
+        out.push(html.slice(i));
+        break;
+      }
+      const tag = html.slice(i, end + 1);
+      if (tag.startsWith("</")) {
+        if (stack.length) stack.pop();
+      } else if (!tag.endsWith("/>")) {
+        stack.push(tag);
+      }
+      out.push(tag);
+      i = end + 1;
+    } else if (ch === "\n") {
+      for (let j = stack.length - 1; j >= 0; j--) out.push("</span>");
+      out.push("\n");
+      for (const t of stack) out.push(t);
+      i++;
+    } else {
+      out.push(ch);
+      i++;
+    }
+  }
+  return out.join("");
+}
+
+function firstVisibleChar(line: string): string {
+  // Strip tags, then take the first non-whitespace char.
+  const stripped = line.replace(/<[^>]+>/g, "");
+  const m = stripped.match(/^\s*(\S)/);
+  return m ? m[1] : "";
+}
+
+export type SnapshotSegment =
+  | { kind: "plain"; html: string }
+  | { kind: "tool"; cmdHtml: string; outHtml: string }
+  | { kind: "gap"; count: number };
+
+/**
+ * Walk the snapshot HTML line by line and group it into `⏺`/`❯`-anchored
+ * blocks:
+ *
+ *   - A block opens at every line whose first visible char is `⏺` (assistant
+ *     output) or `❯` (user input / slash command). The next `⏺` or `❯` ends
+ *     the current block.
+ *   - Inside a block, the first line whose first visible char is `⎿` marks
+ *     the boundary between "command" (above) and "output" (from ⎿ onward).
+ *   - Only `⏺` blocks that have a `⎿` line become collapsible tool calls.
+ *     `❯` blocks (slash-command echoes), `⏺` blocks without `⎿` (assistant
+ *     text, background-task notifications), and anything before the first
+ *     anchor stay as plain content so they render inline with the surrounding
+ *     text.
+ *
+ * Tracking `❯` as a separator is what prevents a multi-line assistant text
+ * message from absorbing the `⎿` result of a later slash command into its
+ * "output" half — the `❯` line closes the assistant block first.
+ */
+export function segmentSnapshot(snapshotHtml: string): SnapshotSegment[] {
+  const normalized = splitSpansAtNewlines(snapshotHtml);
+  const lines = normalized.split("\n");
+
+  const segments: SnapshotSegment[] = [];
+  let plainBuf: string[] = [];
+  let blockBuf: string[] = [];
+  let blockArrow = -1; // index in blockBuf of the first ⎿ line
+  let blockKind: "" | "dot" | "prompt" = "";
+
+  const flushPlain = () => {
+    if (plainBuf.length === 0) return;
+    segments.push({ kind: "plain", html: plainBuf.join("\n") });
+    plainBuf = [];
+  };
+  const flushBlock = () => {
+    if (!blockKind) return;
+    // Peel trailing blank lines off the block — they belong between blocks,
+    // not inside the output. We re-emit them as a plain separator so the
+    // visual gap between consecutive ⏺/❯ blocks survives even when the
+    // command output is collapsed.
+    let trailingBlanks = 0;
+    while (blockBuf.length > 0 && blockBuf[blockBuf.length - 1] === "") {
+      blockBuf.pop();
+      trailingBlanks++;
+    }
+    if (blockKind === "dot" && blockArrow >= 0 && blockArrow < blockBuf.length) {
+      segments.push({
+        kind: "tool",
+        cmdHtml: blockBuf.slice(0, blockArrow).join("\n"),
+        outHtml: blockBuf.slice(blockArrow).join("\n"),
+      });
+    } else {
+      segments.push({ kind: "plain", html: blockBuf.join("\n") });
+    }
+    if (trailingBlanks > 0) {
+      segments.push({ kind: "gap", count: trailingBlanks });
+    }
+    blockBuf = [];
+    blockArrow = -1;
+    blockKind = "";
+  };
+
+  for (const line of lines) {
+    const ch = firstVisibleChar(line);
+    if (ch === "⏺" || ch === "❯") {
+      flushBlock();
+      flushPlain();
+      blockKind = ch === "⏺" ? "dot" : "prompt";
+      blockBuf.push(line);
+    } else if (blockKind) {
+      if (ch === "⎿" && blockArrow < 0) blockArrow = blockBuf.length;
+      blockBuf.push(line);
+    } else {
+      plainBuf.push(line);
+    }
+  }
+  flushBlock();
+  flushPlain();
+  return segments;
+}
+
+/**
+ * Render the segments into a single `<pre class="terminal">`, with tool blocks
+ * living INLINE as `<details>` elements. Because everything is inside one
+ * `<pre>`, the source newlines between segments are preserved as ordinary
+ * pre text — no separator elements needed.
+ *
+ *   - plain → its joined-lines text, dropped in as-is.
+ *   - tool  → `<details class="tool"><summary>cmd</summary>\nout</details>`.
+ *             The `\n` between summary and output lives INSIDE the details
+ *             body, so it hides together with the output when collapsed and
+ *             the command line stays flush with the surrounding text. The
+ *             output has no trailing `\n` — trailing blanks belong to the
+ *             gap segment that follows, not to the body.
+ *   - gap N → `\n` repeated N-1 times. Combined with the two `\n`s the join
+ *             below contributes on either side, this produces N+1 total
+ *             newlines between neighbors, i.e. N visible blank lines.
+ *
+ * Page CSS sets `details.tool` and its `summary` to `display: inline` so the
+ * tool block flows with the pre's text instead of breaking out as a block.
+ */
+export function renderSegments(segments: SnapshotSegment[]): string {
+  const parts: string[] = [];
+  for (const seg of segments) {
+    if (seg.kind === "plain") {
+      parts.push(seg.html);
+    } else if (seg.kind === "tool") {
+      // Wrap the output in an explicit <span> so we can control its
+      // visibility with CSS rather than relying on the browser's native
+      // hiding of text-node descendants of a non-open <details> — that
+      // behavior is unreliable when details is `display: inline`.
+      parts.push(
+        `<details class="tool"><summary>${seg.cmdHtml}</summary><span class="tool-out">\n${seg.outHtml}</span></details>`,
+      );
+    } else {
+      parts.push("\n".repeat(Math.max(0, seg.count - 1)));
+    }
+  }
+  return `<pre class="terminal">${parts.join("\n")}</pre>`;
+}
+
 export interface BuildHtmlOpts {
   sessionId: string;
   snapshots: Snapshot[];
@@ -177,7 +350,8 @@ export function buildHtml(opts: BuildHtmlOpts): string {
       if (!snap) continue;
       const cls = idx === snapIdx[0] ? "snapshot active" : "snapshot";
       const html = mergeAdjacentSpans(classifier.classify(snap.html));
-      inner += `<div class="${cls}" data-snapshot="${idx}"><pre class="terminal">${html}</pre></div>`;
+      const body = renderSegments(segmentSnapshot(html));
+      inner += `<div class="${cls}" data-snapshot="${idx}">${body}</div>`;
     }
     templates += `<template data-w="${w}" data-cols="${cols}">${inner}</template>\n`;
   }
@@ -222,6 +396,22 @@ body {
   padding: 0 2px;
   vertical-align: baseline;
 }
+/* Tool-call blocks sit inside the terminal pre. details.tool is an
+   inline-block so it flows with surrounding text, and the .tool-out body
+   is inline-table so its block of multi-line output keeps its own layout
+   when expanded without breaking the pre's character grid. */
+details.tool { display: inline-block; }
+details.tool > summary {
+  display: inline; cursor: pointer; list-style: none; outline: none;
+  border-radius: 4px; padding: 4px 4px 4px 0;
+}
+details.tool > summary::-webkit-details-marker { display: none; }
+details.tool > summary::marker { content: ""; }
+details.tool::details-content { display: contents; }
+details.tool > .tool-out { display: inline; }
+details.tool:not([open]) > .tool-out { display: none; }
+details.tool > summary:hover { background: rgba(255,255,255,0.06); }
+details.tool[open] > summary { background: rgba(255,255,255,0.03); }
 .hint {
   position: fixed; bottom: 10px; right: 12px;
   font: 11px/1.4 ui-monospace, monospace;
@@ -235,7 +425,7 @@ ${classifier.cssRules()}
 </head>
 <body>
 ${templates}<div id="snap"></div>
-<div class="hint" id="ccs-hint"><b id="ccs-idx">${snapIdx[0]}</b>/${snapIdx[snapIdx.length - 1]} · <kbd>Ctrl</kbd>+<kbd>O</kbd> 切换</div>
+<div class="hint" id="ccs-hint"><b id="ccs-idx">View</b> · <kbd>Ctrl</kbd>+<kbd>O</kbd> 切换</div>
 <script>
 (function () {
   var widths = ${JSON.stringify(widths)};
@@ -265,7 +455,7 @@ ${templates}<div id="snap"></div>
       if (i === activeIdx) snaps[i].classList.add('active');
       else snaps[i].classList.remove('active');
     }
-    if (idxEl && snaps[activeIdx]) idxEl.textContent = snaps[activeIdx].getAttribute('data-snapshot');
+    if (idxEl && snaps[activeIdx]) idxEl.textContent = activeIdx === 0 ? 'View' : 'Detail';
   }
   function cycle() {
     var snaps = snap.querySelectorAll('.snapshot');
