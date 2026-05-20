@@ -181,17 +181,54 @@ export function splitSpansAtNewlines(html: string): string {
   return out.join("");
 }
 
-function firstVisibleChar(line: string): string {
-  // Strip tags, then take the first non-whitespace char.
+/**
+ * Detect a block-starter marker. The line's first element must be a `<span>`
+ * whose content (after trimming whitespace) is exactly one of these glyphs.
+ * Class is ignored — different captures use different deduped class names
+ * for the same color, and conflating that with semantics breaks too easily.
+ *
+ *   ⏺ → tool block start ("dot")
+ *   ❯ → slash-command / user prompt ("prompt")
+ *   ! → bash command ("prompt")
+ */
+function detectBlockStarter(line: string): "dot" | "prompt" | "bash" | "" {
+  // Skip leading whitespace plus any "empty" spans at the start. Those
+  // empty spans are an artifact of splitSpansAtNewlines reopening a
+  // background-colored span on each new line — they have no visible
+  // content but they sit ahead of the marker glyph's own span and would
+  // otherwise capture the first <span>…</span> match here.
+  let rest = line.replace(/^\s+/, "");
+  while (true) {
+    const empty = rest.match(/^<span\b[^>]*>\s*<\/span>\s*/);
+    if (!empty) break;
+    rest = rest.slice(empty[0].length);
+  }
+  const m = rest.match(/^<span\b[^>]*>([^<]*)<\/span>/);
+  if (!m) return "";
+  const content = m[1].trim();
+  if (content === "⏺") return "dot";
+  if (content === "❯") return "prompt";
+  if (content === "!") return "bash";
+  return "";
+}
+
+/**
+ * Detect the `⎿` output-line marker inside a block. Unlike block starters
+ * this one stays lenient — short tool outputs often render with `⎿` and the
+ * output text packed into a single span (`<span class="b">  ⎿  (No output)</span>`)
+ * which wouldn't match a "standalone-span" check.
+ */
+function lineStartsWithArrow(line: string): boolean {
   const stripped = line.replace(/<[^>]+>/g, "");
   const m = stripped.match(/^\s*(\S)/);
-  return m ? m[1] : "";
+  return m ? m[1] === "⎿" : false;
 }
 
 export type SnapshotSegment =
   | { kind: "plain"; html: string }
   | { kind: "prompt"; html: string }
   | { kind: "tool"; cmdHtml: string; outHtml: string }
+  | { kind: "bashTool"; cmdHtml: string; outHtml: string }
   | { kind: "gap"; count: number };
 
 /**
@@ -221,7 +258,7 @@ export function segmentSnapshot(snapshotHtml: string): SnapshotSegment[] {
   let plainBuf: string[] = [];
   let blockBuf: string[] = [];
   let blockArrow = -1; // index in blockBuf of the first ⎿ line
-  let blockKind: "" | "dot" | "prompt" = "";
+  let blockKind: "" | "dot" | "prompt" | "bash" = "";
 
   const flushPlain = () => {
     if (plainBuf.length === 0) return;
@@ -245,7 +282,13 @@ export function segmentSnapshot(snapshotHtml: string): SnapshotSegment[] {
         cmdHtml: blockBuf.slice(0, blockArrow).join("\n"),
         outHtml: blockBuf.slice(blockArrow).join("\n"),
       });
-    } else if (blockKind === "prompt") {
+    } else if (blockKind === "bash" && blockArrow >= 0 && blockArrow < blockBuf.length) {
+      segments.push({
+        kind: "bashTool",
+        cmdHtml: blockBuf.slice(0, blockArrow).join("\n"),
+        outHtml: blockBuf.slice(blockArrow).join("\n"),
+      });
+    } else if (blockKind === "prompt" || blockKind === "bash") {
       segments.push({ kind: "prompt", html: blockBuf.join("\n") });
     } else {
       segments.push({ kind: "plain", html: blockBuf.join("\n") });
@@ -259,14 +302,16 @@ export function segmentSnapshot(snapshotHtml: string): SnapshotSegment[] {
   };
 
   for (const line of lines) {
-    const ch = firstVisibleChar(line);
-    if (ch === "⏺" || ch === "❯") {
+    const starter = detectBlockStarter(line);
+    if (starter) {
       flushBlock();
       flushPlain();
-      blockKind = ch === "⏺" ? "dot" : "prompt";
+      blockKind = starter;
       blockBuf.push(line);
     } else if (blockKind) {
-      if (ch === "⎿" && blockArrow < 0) blockArrow = blockBuf.length;
+      if (blockArrow < 0 && lineStartsWithArrow(line)) {
+        blockArrow = blockBuf.length;
+      }
       blockBuf.push(line);
     } else {
       plainBuf.push(line);
@@ -315,6 +360,12 @@ export function renderSegments(segments: SnapshotSegment[]): string {
       // behavior is unreliable when details is `display: inline`.
       parts.push(
         `<details class="tool"><summary>${seg.cmdHtml}</summary><span class="tool-out">\n${seg.outHtml}</span></details>`,
+      );
+    } else if (seg.kind === "bashTool") {
+      // Same shape as a tool block but tagged as a user prompt so the menu
+      // lists the `! cmd` line alongside `❯ /slash` entries.
+      parts.push(
+        `<details class="tool user-prompt" data-prompt-idx="${promptIdx++}"><summary>${seg.cmdHtml}</summary><span class="tool-out">\n${seg.outHtml}</span></details>`,
       );
     } else {
       parts.push("\n".repeat(Math.max(0, seg.count - 1)));
@@ -416,7 +467,10 @@ details.tool > summary {
 }
 details.tool > summary::-webkit-details-marker { display: none; }
 details.tool > summary::marker { content: ""; }
-details.tool::details-content { display: contents; }
+/* Skip the ::details-content {display:contents} hack — overriding the
+   pseudo-element's box also disables Chrome's built-in "hide non-summary
+   children when not [open]" mechanism, which leaves the body always
+   visible. The explicit .tool-out rules below handle layout + visibility. */
 details.tool > .tool-out { display: inline; }
 details.tool:not([open]) > .tool-out { display: none; }
 details.tool > summary:hover { background: rgba(255,255,255,0.06); }

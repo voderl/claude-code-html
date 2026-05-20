@@ -130,6 +130,17 @@ export class Tmux {
   }
 
   /**
+   * Capture only the visible pane (no scrollback). Used while paginating
+   * through Claude's transcript with PageDown: each page is a fresh frame,
+   * scrollback is irrelevant because NO_FLICKER mode redraws in place.
+   */
+  capturePaneVisible(name: string, withAnsi: boolean): string {
+    const args = ["capture-pane", "-p", "-S", "0", "-E", "-", "-t", name];
+    if (withAnsi) args.push("-e");
+    return this.run(args, { check: true }).stdout;
+  }
+
+  /**
    * Read the pane title (the string the TUI most recently set via OSC 0/2,
    * exposed as tmux's #{pane_title} format). Returns "" if unavailable.
    */
