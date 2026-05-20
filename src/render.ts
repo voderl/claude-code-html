@@ -190,6 +190,7 @@ function firstVisibleChar(line: string): string {
 
 export type SnapshotSegment =
   | { kind: "plain"; html: string }
+  | { kind: "prompt"; html: string }
   | { kind: "tool"; cmdHtml: string; outHtml: string }
   | { kind: "gap"; count: number };
 
@@ -244,6 +245,8 @@ export function segmentSnapshot(snapshotHtml: string): SnapshotSegment[] {
         cmdHtml: blockBuf.slice(0, blockArrow).join("\n"),
         outHtml: blockBuf.slice(blockArrow).join("\n"),
       });
+    } else if (blockKind === "prompt") {
+      segments.push({ kind: "prompt", html: blockBuf.join("\n") });
     } else {
       segments.push({ kind: "plain", html: blockBuf.join("\n") });
     }
@@ -296,9 +299,15 @@ export function segmentSnapshot(snapshotHtml: string): SnapshotSegment[] {
  */
 export function renderSegments(segments: SnapshotSegment[]): string {
   const parts: string[] = [];
+  let promptIdx = 0;
   for (const seg of segments) {
     if (seg.kind === "plain") {
       parts.push(seg.html);
+    } else if (seg.kind === "prompt") {
+      // Wrap so the menu script can find these and jump to their position.
+      parts.push(
+        `<span class="user-prompt" data-prompt-idx="${promptIdx++}">${seg.html}</span>`,
+      );
     } else if (seg.kind === "tool") {
       // Wrap the output in an explicit <span> so we can control its
       // visibility with CSS rather than relying on the browser's native
@@ -420,11 +429,47 @@ details.tool[open] > summary { background: rgba(255,255,255,0.03); }
   user-select: none; pointer-events: none;
 }
 .hint b { color: #fff; }
+/* Prompt-jump menu — top-right hamburger that opens a list of the user's
+   prompts. Each item is the prompt's textContent, ellipsized, and clicking
+   one scrolls to that prompt's <span class="user-prompt"> in the active
+   snapshot. */
+.ccs-menu {
+  position: fixed; top: 10px; right: 12px; z-index: 10;
+  font: 12px/1.4 ui-monospace, monospace;
+}
+.ccs-menu-btn {
+  background: rgba(0,0,0,0.55); color: #e5e5e5;
+  border: 1px solid #333; border-radius: 4px;
+  padding: 4px 8px; cursor: pointer; font: inherit;
+}
+.ccs-menu-btn:hover { background: rgba(0,0,0,0.75); }
+.ccs-menu-list {
+  display: none;
+  position: absolute; top: calc(100% + 4px); right: 0;
+  min-width: 240px; max-width: min(420px, 90vw);
+  max-height: 60vh; overflow-y: auto;
+  background: #1f1f1f; color: #e5e5e5;
+  border: 1px solid #3a3a3a; border-radius: 4px;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.5);
+}
+.ccs-menu.open .ccs-menu-list { display: block; }
+.ccs-menu-item {
+  display: block; padding: 6px 10px; color: inherit;
+  text-decoration: none; cursor: pointer;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  border-bottom: 1px solid #2a2a2a;
+}
+.ccs-menu-item:last-child { border-bottom: 0; }
+.ccs-menu-item:hover { background: rgba(255,255,255,0.06); }
+.ccs-menu-empty {
+  padding: 8px 10px; color: #888; font-style: italic;
+}
 ${classifier.cssRules()}
 </style>
 </head>
 <body>
 ${templates}<div id="snap"></div>
+<div class="ccs-menu" id="ccs-menu"><button class="ccs-menu-btn" id="ccs-menu-btn" type="button" aria-label="提问列表">☰</button><div class="ccs-menu-list" id="ccs-menu-list"></div></div>
 <div class="hint" id="ccs-hint"><b id="ccs-idx">View</b> · <kbd>Ctrl</kbd>+<kbd>O</kbd> 切换</div>
 <script>
 (function () {
@@ -432,6 +477,9 @@ ${templates}<div id="snap"></div>
   var snap = document.getElementById('snap');
   var idxEl = document.getElementById('ccs-idx');
   var hint = document.getElementById('ccs-hint');
+  var menu = document.getElementById('ccs-menu');
+  var menuBtn = document.getElementById('ccs-menu-btn');
+  var menuList = document.getElementById('ccs-menu-list');
   var activeIdx = 0;
   var curW = -1;
   function pickW() {
@@ -462,6 +510,62 @@ ${templates}<div id="snap"></div>
     if (snaps.length <= 1) return;
     activeIdx = (activeIdx + 1) % snaps.length;
     apply();
+  }
+  function buildMenu() {
+    var activeSnap = snap.querySelector('.snapshot.active') || snap;
+    var prompts = activeSnap.querySelectorAll('.user-prompt');
+    menuList.textContent = '';
+    if (!prompts.length) {
+      var empty = document.createElement('div');
+      empty.className = 'ccs-menu-empty';
+      empty.textContent = '（暂无提问）';
+      menuList.appendChild(empty);
+      return;
+    }
+    for (var i = 0; i < prompts.length; i++) {
+      var raw = (prompts[i].innerText || prompts[i].textContent || '').trim();
+      var label = raw.replace(/^❯\\s*/, '');
+      // Anything from a ⎿ marker onward is slash-command output, not the
+      // user's question — drop it from the label.
+      var arrow = label.indexOf('⎿');
+      if (arrow >= 0) label = label.slice(0, arrow);
+      label = label.replace(/\\s+/g, ' ').trim();
+      // Bypass-permissions banner shows up as a ❯ block sandwiched between
+      // box-drawing rules. Skip entries whose content is just decorative.
+      if (!label || /^─/.test(label)) continue;
+      var item = document.createElement('a');
+      item.className = 'ccs-menu-item';
+      item.href = '#';
+      item.textContent = label;
+      item.title = label;
+      (function (target) {
+        item.addEventListener('click', function (e) {
+          e.preventDefault();
+          target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          menu.classList.remove('open');
+        });
+      })(prompts[i]);
+      menuList.appendChild(item);
+    }
+    if (!menuList.children.length) {
+      var empty2 = document.createElement('div');
+      empty2.className = 'ccs-menu-empty';
+      empty2.textContent = '（暂无提问）';
+      menuList.appendChild(empty2);
+    }
+  }
+  if (menuBtn) {
+    menuBtn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      var open = menu.classList.contains('open');
+      if (!open) buildMenu();
+      menu.classList.toggle('open');
+    });
+    document.addEventListener('click', function (e) {
+      if (menu.classList.contains('open') && !menu.contains(e.target)) {
+        menu.classList.remove('open');
+      }
+    });
   }
   render();
   window.addEventListener('resize', render);
