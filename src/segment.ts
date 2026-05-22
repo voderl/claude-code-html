@@ -22,20 +22,36 @@ function firstVisibleChar(line: string): string {
 // a few palette tones (green vs white ⏺, etc.).
 const SGR_PREFIX_RE = /^\x1b\[[\d;]*m/;
 
+// Right-aligned "08:01 PM claude-opus-4-7" chrome that Claude inserts
+// between some assistant turns. It isn't anchored to any block, has no
+// leading SGR (just whitespace), and if we leave it in it ends up wedged
+// inside the previous tool's output and eats the blank line that would
+// otherwise separate that tool from the next block.
+const TIMESTAMP_RE = /\x1b\[38;5;246m\d{1,2}:\d{2}\x1b\[39m\s*\x1b\[38;5;246m(?:AM|PM)\x1b/;
+
 export type Segment =
   | { kind: "plain"; ansi: string }
   | { kind: "prompt"; ansi: string }
+  | { kind: "agent"; ansi: string }
   | { kind: "tool"; cmdAnsi: string; outAnsi: string }
   | { kind: "bashTool"; cmdAnsi: string; outAnsi: string }
   | { kind: "gap"; count: number };
 
-type BlockKind = "tool" | "prompt" | "bashTool";
+type BlockKind = "tool" | "prompt" | "bashTool" | "agent";
+
+// White (xterm 231) ⏺ is assistant prose — distinct from the green tool
+// dot. The earlier glyph+SGR check accepts any colour for ⏺; this is the
+// one spot we *do* differentiate, because the two kinds render differently
+// (agent prose gets wrapped in a span, tool calls fold into <details>).
+const AGENT_DOT_RE = /^\x1b\[(?:[\d;]*;)?38;5;231m\x1b\[/;
 
 function detectStart(line: string): BlockKind | "" {
   if (!SGR_PREFIX_RE.test(line)) return "";
   switch (firstVisibleChar(line)) {
     case "⏺":
-      return "tool";
+      return AGENT_DOT_RE.test(line) || line.startsWith("\x1b[38;5;231m⏺")
+        ? "agent"
+        : "tool";
     case "❯":
       return "prompt";
     case "!":
@@ -113,13 +129,17 @@ export function segmentAnsi(ansi: string): Segment[] {
         segs.push({ kind: "plain", ansi: outBuf.join("\n") });
       }
       pushGap(trail);
+    } else if (blockKind === "agent") {
+      const trail = peelTrailing(cmdBuf);
+      segs.push({ kind: "agent", ansi: cmdBuf.join("\n") });
+      pushGap(trail);
     } else if (blockKind === "bashTool") {
       // No ⎿ output — degrade to a prompt-only segment (just `! cmd`).
       const trail = peelTrailing(cmdBuf);
       segs.push({ kind: "prompt", ansi: cmdBuf.join("\n") });
       pushGap(trail);
     } else {
-      // ⏺ without ⎿: assistant prose, render as plain.
+      // Green ⏺ without ⎿ — unusual, render as plain so nothing is lost.
       const trail = peelTrailing(cmdBuf);
       segs.push({ kind: "plain", ansi: cmdBuf.join("\n") });
       pushGap(trail);
@@ -131,6 +151,11 @@ export function segmentAnsi(ansi: string): Segment[] {
   };
 
   for (const line of lines) {
+    // Drop right-aligned timestamp chrome before classification — they'd
+    // otherwise wedge themselves into whatever block is currently open and
+    // suppress the gap that separates it from the next block.
+    if (TIMESTAMP_RE.test(line)) continue;
+
     const starter = detectStart(line);
     if (starter) {
       flushBlock();
@@ -140,8 +165,13 @@ export function segmentAnsi(ansi: string): Segment[] {
       continue;
     }
     if (blockKind) {
-      if (!arrow && isOutputArrow(line)) arrow = true;
-      (arrow ? outBuf : cmdBuf).push(line);
+      // Agent prose has no cmd/out split — its whole body is the message.
+      if (blockKind === "agent") {
+        cmdBuf.push(line);
+      } else {
+        if (!arrow && isOutputArrow(line)) arrow = true;
+        (arrow ? outBuf : cmdBuf).push(line);
+      }
     } else {
       plainBuf.push(line);
     }

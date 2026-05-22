@@ -46,6 +46,10 @@ export function renderAnsi(ansi: string, classifier: StyleClassifier): string {
       parts.push(
         `<span class="user-prompt" data-prompt-idx="${promptIdx++}">${ansiChunkToHtml(seg.ansi, classifier)}</span>`,
       );
+    } else if (seg.kind === "agent") {
+      parts.push(
+        `<span class="agent-prompt">${ansiChunkToHtml(seg.ansi, classifier)}</span>`,
+      );
     } else if (seg.kind === "tool") {
       // Output sits inside an explicit .tool-out span so CSS can hide it
       // when <details> is closed (display:inline details + native hiding
@@ -218,7 +222,10 @@ export function buildHtml(opts: BuildHtmlOpts): string {
       if (!snap) continue;
       const cls = idx === snapIdx[0] ? "snapshot active" : "snapshot";
       const body = renderAnsi(snap.ansi, classifier);
-      inner += `<div class="${cls}" data-snapshot="${idx}">${body}</div>`;
+      // Expose the capture's column count as a CSS variable so .tool's
+      // ellipsis cap (max-width: var(--cols)) matches the exported pane
+      // width — e.g. a 50-col snapshot caps tool summaries at 50ch.
+      inner += `<div class="${cls}" data-snapshot="${idx}" style="--cols:${snap.cols}ch">${body}</div>`;
     }
     templates += `<template data-w="${w}" data-cols="${cols}">${inner}</template>\n`;
   }
@@ -264,24 +271,50 @@ body {
   vertical-align: baseline;
 }
 /* Tool-call blocks sit inside the terminal pre. details.tool is an
-   inline-block so it flows with surrounding text, and the .tool-out body
-   is inline-table so its block of multi-line output keeps its own layout
-   when expanded without breaking the pre's character grid. */
-details.tool { display: inline-block; }
+   inline-block so it flows with surrounding text. max-width: 100% caps the
+   element to the pre's content width — that gives the closed summary a
+   real width to ellipsis against. line-height tightens vertical rhythm so
+   stacked tool blocks don't drift apart. */
+details.tool {
+  display: inline-block;
+  max-width: var(--cols, 100ch);
+  vertical-align: top;
+  line-height: 1.15;
+  /* Pull the box back in by exactly the summary's padding so the visual
+     footprint matches the text content while the summary keeps the
+     padding for its hover target / background. */
+  margin: -4px -4px -4px 0px;
+}
 details.tool > summary {
-  display: inline; cursor: pointer; list-style: none; outline: none;
-  border-radius: 4px; padding: 4px 4px 4px 0;
+  /* Fixed-width inline-block sized to the capture's column count; both
+     states share the box so the open ↔ closed transition doesn't reflow
+     anything around it. Closed adds the ellipsis clamp on top. */
+  display: inline-block;
+  width: var(--cols, 100ch);
+  line-height: 1.3;
+  cursor: pointer; list-style: none; outline: none;
+  border-radius: 4px; padding: 4px 4px 4px 0px;
 }
 details.tool > summary::-webkit-details-marker { display: none; }
 details.tool > summary::marker { content: ""; }
-/* Skip the ::details-content {display:contents} hack — overriding the
-   pseudo-element's box also disables Chrome's built-in "hide non-summary
-   children when not [open]" mechanism, which leaves the body always
-   visible. The explicit .tool-out rules below handle layout + visibility. */
+details.tool:not([open]) > summary {
+  /* Single-line ellipsis when closed. nowrap collapses any embedded
+     newline continuations of long cmds into spaces — that's the price of
+     native text-overflow ellipsis. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+details.tool[open] > summary { background: rgba(255,255,255,0.03); }
+details.tool > summary:hover { background: rgba(255,255,255,0.06); }
+/* Make the ::details-content wrapper transparent so the .tool-out span sits
+   inline next to <summary>; without this, Chrome's default block-level
+   wrapper inserts a line break between the summary and the expanded body.
+   We trade Chrome's built-in "hide non-summary children when closed" for
+   the explicit .tool-out hide rule below. */
+details.tool::details-content { display: contents; }
 details.tool > .tool-out { display: inline; }
 details.tool:not([open]) > .tool-out { display: none; }
-details.tool > summary:hover { background: rgba(255,255,255,0.06); }
-details.tool[open] > summary { background: rgba(255,255,255,0.03); }
 .hint {
   position: fixed; bottom: 10px; right: 12px;
   font: 11px/1.4 ui-monospace, monospace;
