@@ -14,8 +14,11 @@
     "start": "node dist/cli.js"
   },
   "dependencies": {
+    "@types/diff": "^7.0.2",
     "ansi_up": "^6.0.2",
-    "commander": "^12.1.0"
+    "commander": "^12.1.0",
+    "diff": "^9.0.0",
+    "highlight.js": "^11.11.1"
   },
   "devDependencies": {
     "@types/node": "^22.7.0",
