@@ -3,7 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { Command } from "commander";
 import { Tmux, waitForStable, checkTmuxAvailable } from "./tmux";
-import { Snapshot, ansiToHtml, buildHtml } from "./render";
+import { Snapshot, buildHtml } from "./render";
 
 interface ColsSpec {
   cols: number;
@@ -109,7 +109,7 @@ async function captureWidth(opts: {
     });
 
   let paneTitle = "";
-  let html = "";
+  let trimmed = "";
   try {
     opts.log(`${tag} waiting for initial render to settle...`);
     await wait();
@@ -137,15 +137,14 @@ async function captureWidth(opts: {
       opts.log(`${tag} wrote ${file}`);
     }
 
-    const trimmed = trimPaneFrame(ansi);
-    html = ansiToHtml(trimmed);
+    trimmed = trimPaneFrame(ansi);
     opts.log(`${tag} captured ${trimmed.split("\n").length} lines`);
   } finally {
     if (opts.tmux.hasSession(name)) opts.tmux.killSession(name);
   }
 
-  const snapshots: Snapshot[] = html
-    ? [{ width: opts.spec.px, cols: opts.spec.cols, index: 0, html }]
+  const snapshots: Snapshot[] = trimmed
+    ? [{ width: opts.spec.px, cols: opts.spec.cols, index: 0, ansi: trimmed }]
     : [];
   return { snapshots, paneTitle };
 }

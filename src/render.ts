@@ -1,32 +1,73 @@
 import { AnsiUp } from "ansi_up";
+import { cleanAnsi, segmentAnsi } from "./segment";
 
 export interface Snapshot {
   width: number; // pixel bucket
   cols: number; // tmux column count used at capture
   index: number; // 0 = initial (post-ESC), 1 = post-Ctrl+O, ...
-  html: string; // rendered <pre>-inner HTML
+  ansi: string; // already-trimmed ANSI from tmux capture-pane -e
 }
 
-export function ansiToHtml(ansi: string): string {
+/**
+ * Render one ANSI chunk to inline-HTML via ansi_up, then route it through
+ * CJK wrapping, style classification (so repeated colours collapse to short
+ * class names), and adjacent-span merging. Each call is independent — we
+ * never let ansi_up state leak across segments.
+ */
+function ansiChunkToHtml(ansi: string, classifier: StyleClassifier): string {
+  if (!ansi) return "";
   const up = new AnsiUp();
-  // Inline styles — we class-ify them later in buildHtml.
   up.use_classes = false;
-  // Strip leading/trailing blank lines that tmux pads to fill the visible pane,
-  // but keep internal whitespace intact.
-  const stripped = ansi.replace(/^[\s ]*\n/g, "").replace(/[\s ]*\n*$/g, "\n");
-  // Strip OSC sequences (ESC ] ... ST). ansi_up only understands CSI/SGR, so
-  // OSC 8 hyperlinks would otherwise leak their ]8;…\ body into the HTML as
-  // garbage. Dropping the start/end markers preserves the anchor text between.
-  const cleaned = stripped
-    .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/g, "")
-    // Drop non-SGR CSI control sequences ansi_up doesn't recognize.
-    .replace(/\x1b\[\??[0-9;]*[hlABCDsuJKf]/g, "");
-
-  let html = up.ansi_to_html(cleaned);
+  let html = up.ansi_to_html(ansi);
   // Terminal "bold" reads as weight 500-600 visually; browser `bold` (700)
   // looks heavier than what the user sees in their terminal.
   html = html.replace(/font-weight:bold\b/g, "font-weight:500");
-  return wrapCJK(html);
+  html = wrapCJK(html);
+  html = classifier.classify(html);
+  html = mergeAdjacentSpans(html);
+  return html;
+}
+
+/**
+ * Render a full snapshot's ANSI as the body of a `<pre class="terminal">`:
+ * clean → segment at the ANSI level → emit each segment through ansi_up
+ * separately. Tool blocks become inline `<details>`; user prompts and bash
+ * runs become `<span class="user-prompt">`; gaps preserve the visual
+ * whitespace between blocks.
+ */
+export function renderAnsi(ansi: string, classifier: StyleClassifier): string {
+  const segs = segmentAnsi(cleanAnsi(ansi));
+  const parts: string[] = [];
+  let promptIdx = 0;
+  for (const seg of segs) {
+    if (seg.kind === "plain") {
+      parts.push(ansiChunkToHtml(seg.ansi, classifier));
+    } else if (seg.kind === "prompt") {
+      parts.push(
+        `<span class="user-prompt" data-prompt-idx="${promptIdx++}">${ansiChunkToHtml(seg.ansi, classifier)}</span>`,
+      );
+    } else if (seg.kind === "tool") {
+      // Output sits inside an explicit .tool-out span so CSS can hide it
+      // when <details> is closed (display:inline details + native hiding
+      // of non-summary children is unreliable in browsers).
+      parts.push(
+        `<details class="tool"><summary>${ansiChunkToHtml(seg.cmdAnsi, classifier)}</summary><span class="tool-out">\n${ansiChunkToHtml(seg.outAnsi, classifier)}</span></details>`,
+      );
+    } else if (seg.kind === "bashTool") {
+      // .user-prompt sits on the <summary> (not the <details>) so its
+      // textContent is just the `! cmd` line — the menu can use it as the
+      // title without scanning past the ⎿ output that follows inside.
+      parts.push(
+        `<details class="tool"><summary class="user-prompt" data-prompt-idx="${promptIdx++}">${ansiChunkToHtml(seg.cmdAnsi, classifier)}</summary><span class="tool-out">\n${ansiChunkToHtml(seg.outAnsi, classifier)}</span></details>`,
+      );
+    } else {
+      // gap.count N → N visible blank lines. Each parts[] entry is joined
+      // with one "\n", so N-1 explicit "\n" plus the two joining ones
+      // produces N+1 newlines between neighbours = N blanks.
+      parts.push("\n".repeat(Math.max(0, seg.count - 1)));
+    }
+  }
+  return `<pre class="terminal">${parts.join("\n")}</pre>`;
 }
 
 // CJK Unified Ideographs + extensions, Hiragana, Katakana, CJK Symbols and
@@ -141,239 +182,6 @@ function shortName(n: number): string {
   return LEAD[m] + s;
 }
 
-/**
- * After ansi_up + classify + merge, spans can still cross `\n` boundaries
- * because tmux paints contiguous background runs (e.g. the prompt strip) across
- * the trailing newline. Close every open span before a newline and reopen them
- * after, so each source line is self-contained — that lets the tool-call
- * segmenter slice on `\n` without re-balancing tags.
- */
-export function splitSpansAtNewlines(html: string): string {
-  const out: string[] = [];
-  const stack: string[] = [];
-  let i = 0;
-  while (i < html.length) {
-    const ch = html[i];
-    if (ch === "<") {
-      const end = html.indexOf(">", i);
-      if (end < 0) {
-        out.push(html.slice(i));
-        break;
-      }
-      const tag = html.slice(i, end + 1);
-      if (tag.startsWith("</")) {
-        if (stack.length) stack.pop();
-      } else if (!tag.endsWith("/>")) {
-        stack.push(tag);
-      }
-      out.push(tag);
-      i = end + 1;
-    } else if (ch === "\n") {
-      for (let j = stack.length - 1; j >= 0; j--) out.push("</span>");
-      out.push("\n");
-      for (const t of stack) out.push(t);
-      i++;
-    } else {
-      out.push(ch);
-      i++;
-    }
-  }
-  return out.join("");
-}
-
-/**
- * Detect a block-starter marker. The line's first element must be a `<span>`
- * whose content (after trimming whitespace) is exactly one of these glyphs.
- * Class is ignored — different captures use different deduped class names
- * for the same color, and conflating that with semantics breaks too easily.
- *
- *   ⏺ → tool block start ("dot")
- *   ❯ → slash-command / user prompt ("prompt")
- *   ! → bash command ("prompt")
- */
-function detectBlockStarter(line: string): "dot" | "prompt" | "bash" | "" {
-  // Skip leading whitespace plus any "empty" spans at the start. Those
-  // empty spans are an artifact of splitSpansAtNewlines reopening a
-  // background-colored span on each new line — they have no visible
-  // content but they sit ahead of the marker glyph's own span and would
-  // otherwise capture the first <span>…</span> match here.
-  let rest = line.replace(/^\s+/, "");
-  while (true) {
-    const empty = rest.match(/^<span\b[^>]*>\s*<\/span>\s*/);
-    if (!empty) break;
-    rest = rest.slice(empty[0].length);
-  }
-  const m = rest.match(/^<span\b[^>]*>([^<]*)<\/span>/);
-  if (!m) return "";
-  const content = m[1].trim();
-  if (content === "⏺") return "dot";
-  if (content === "❯") return "prompt";
-  if (content === "!") return "bash";
-  return "";
-}
-
-/**
- * Detect the `⎿` output-line marker inside a block. Unlike block starters
- * this one stays lenient — short tool outputs often render with `⎿` and the
- * output text packed into a single span (`<span class="b">  ⎿  (No output)</span>`)
- * which wouldn't match a "standalone-span" check.
- */
-function lineStartsWithArrow(line: string): boolean {
-  const stripped = line.replace(/<[^>]+>/g, "");
-  const m = stripped.match(/^\s*(\S)/);
-  return m ? m[1] === "⎿" : false;
-}
-
-export type SnapshotSegment =
-  | { kind: "plain"; html: string }
-  | { kind: "prompt"; html: string }
-  | { kind: "tool"; cmdHtml: string; outHtml: string }
-  | { kind: "bashTool"; cmdHtml: string; outHtml: string }
-  | { kind: "gap"; count: number };
-
-/**
- * Walk the snapshot HTML line by line and group it into `⏺`/`❯`-anchored
- * blocks:
- *
- *   - A block opens at every line whose first visible char is `⏺` (assistant
- *     output) or `❯` (user input / slash command). The next `⏺` or `❯` ends
- *     the current block.
- *   - Inside a block, the first line whose first visible char is `⎿` marks
- *     the boundary between "command" (above) and "output" (from ⎿ onward).
- *   - Only `⏺` blocks that have a `⎿` line become collapsible tool calls.
- *     `❯` blocks (slash-command echoes), `⏺` blocks without `⎿` (assistant
- *     text, background-task notifications), and anything before the first
- *     anchor stay as plain content so they render inline with the surrounding
- *     text.
- *
- * Tracking `❯` as a separator is what prevents a multi-line assistant text
- * message from absorbing the `⎿` result of a later slash command into its
- * "output" half — the `❯` line closes the assistant block first.
- */
-export function segmentSnapshot(snapshotHtml: string): SnapshotSegment[] {
-  const normalized = splitSpansAtNewlines(snapshotHtml);
-  const lines = normalized.split("\n");
-
-  const segments: SnapshotSegment[] = [];
-  let plainBuf: string[] = [];
-  let blockBuf: string[] = [];
-  let blockArrow = -1; // index in blockBuf of the first ⎿ line
-  let blockKind: "" | "dot" | "prompt" | "bash" = "";
-
-  const flushPlain = () => {
-    if (plainBuf.length === 0) return;
-    segments.push({ kind: "plain", html: plainBuf.join("\n") });
-    plainBuf = [];
-  };
-  const flushBlock = () => {
-    if (!blockKind) return;
-    // Peel trailing blank lines off the block — they belong between blocks,
-    // not inside the output. We re-emit them as a plain separator so the
-    // visual gap between consecutive ⏺/❯ blocks survives even when the
-    // command output is collapsed.
-    let trailingBlanks = 0;
-    while (blockBuf.length > 0 && blockBuf[blockBuf.length - 1] === "") {
-      blockBuf.pop();
-      trailingBlanks++;
-    }
-    if (blockKind === "dot" && blockArrow >= 0 && blockArrow < blockBuf.length) {
-      segments.push({
-        kind: "tool",
-        cmdHtml: blockBuf.slice(0, blockArrow).join("\n"),
-        outHtml: blockBuf.slice(blockArrow).join("\n"),
-      });
-    } else if (blockKind === "bash" && blockArrow >= 0 && blockArrow < blockBuf.length) {
-      segments.push({
-        kind: "bashTool",
-        cmdHtml: blockBuf.slice(0, blockArrow).join("\n"),
-        outHtml: blockBuf.slice(blockArrow).join("\n"),
-      });
-    } else if (blockKind === "prompt" || blockKind === "bash") {
-      segments.push({ kind: "prompt", html: blockBuf.join("\n") });
-    } else {
-      segments.push({ kind: "plain", html: blockBuf.join("\n") });
-    }
-    if (trailingBlanks > 0) {
-      segments.push({ kind: "gap", count: trailingBlanks });
-    }
-    blockBuf = [];
-    blockArrow = -1;
-    blockKind = "";
-  };
-
-  for (const line of lines) {
-    const starter = detectBlockStarter(line);
-    if (starter) {
-      flushBlock();
-      flushPlain();
-      blockKind = starter;
-      blockBuf.push(line);
-    } else if (blockKind) {
-      if (blockArrow < 0 && lineStartsWithArrow(line)) {
-        blockArrow = blockBuf.length;
-      }
-      blockBuf.push(line);
-    } else {
-      plainBuf.push(line);
-    }
-  }
-  flushBlock();
-  flushPlain();
-  return segments;
-}
-
-/**
- * Render the segments into a single `<pre class="terminal">`, with tool blocks
- * living INLINE as `<details>` elements. Because everything is inside one
- * `<pre>`, the source newlines between segments are preserved as ordinary
- * pre text — no separator elements needed.
- *
- *   - plain → its joined-lines text, dropped in as-is.
- *   - tool  → `<details class="tool"><summary>cmd</summary>\nout</details>`.
- *             The `\n` between summary and output lives INSIDE the details
- *             body, so it hides together with the output when collapsed and
- *             the command line stays flush with the surrounding text. The
- *             output has no trailing `\n` — trailing blanks belong to the
- *             gap segment that follows, not to the body.
- *   - gap N → `\n` repeated N-1 times. Combined with the two `\n`s the join
- *             below contributes on either side, this produces N+1 total
- *             newlines between neighbors, i.e. N visible blank lines.
- *
- * Page CSS sets `details.tool` and its `summary` to `display: inline` so the
- * tool block flows with the pre's text instead of breaking out as a block.
- */
-export function renderSegments(segments: SnapshotSegment[]): string {
-  const parts: string[] = [];
-  let promptIdx = 0;
-  for (const seg of segments) {
-    if (seg.kind === "plain") {
-      parts.push(seg.html);
-    } else if (seg.kind === "prompt") {
-      // Wrap so the menu script can find these and jump to their position.
-      parts.push(
-        `<span class="user-prompt" data-prompt-idx="${promptIdx++}">${seg.html}</span>`,
-      );
-    } else if (seg.kind === "tool") {
-      // Wrap the output in an explicit <span> so we can control its
-      // visibility with CSS rather than relying on the browser's native
-      // hiding of text-node descendants of a non-open <details> — that
-      // behavior is unreliable when details is `display: inline`.
-      parts.push(
-        `<details class="tool"><summary>${seg.cmdHtml}</summary><span class="tool-out">\n${seg.outHtml}</span></details>`,
-      );
-    } else if (seg.kind === "bashTool") {
-      // Same shape as a tool block but tagged as a user prompt so the menu
-      // lists the `! cmd` line alongside `❯ /slash` entries.
-      parts.push(
-        `<details class="tool user-prompt" data-prompt-idx="${promptIdx++}"><summary>${seg.cmdHtml}</summary><span class="tool-out">\n${seg.outHtml}</span></details>`,
-      );
-    } else {
-      parts.push("\n".repeat(Math.max(0, seg.count - 1)));
-    }
-  }
-  return `<pre class="terminal">${parts.join("\n")}</pre>`;
-}
-
 export interface BuildHtmlOpts {
   sessionId: string;
   snapshots: Snapshot[];
@@ -409,8 +217,7 @@ export function buildHtml(opts: BuildHtmlOpts): string {
       const snap = snapshots.find((s) => s.index === idx && s.width === w);
       if (!snap) continue;
       const cls = idx === snapIdx[0] ? "snapshot active" : "snapshot";
-      const html = mergeAdjacentSpans(classifier.classify(snap.html));
-      const body = renderSegments(segmentSnapshot(html));
+      const body = renderAnsi(snap.ansi, classifier);
       inner += `<div class="${cls}" data-snapshot="${idx}">${body}</div>`;
     }
     templates += `<template data-w="${w}" data-cols="${cols}">${inner}</template>\n`;
@@ -438,7 +245,7 @@ body {
   padding: 16px 12px 32px;
   font-variant-ligatures: none;
 }
-.terminal { white-space: pre; margin: 0; overflow-x: auto; tab-size: 4; }
+.terminal { white-space: pre; margin: 0; tab-size: 4; }
 .snapshot { display: none; }
 .snapshot.active { display: block; }
 /* CJK runs render inside an inline-block whose width is class-driven
@@ -577,15 +384,13 @@ ${templates}<div id="snap"></div>
       return;
     }
     for (var i = 0; i < prompts.length; i++) {
-      var raw = (prompts[i].innerText || prompts[i].textContent || '').trim();
-      var label = raw.replace(/^❯\\s*/, '');
-      // Anything from a ⎿ marker onward is slash-command output, not the
-      // user's question — drop it from the label.
-      var arrow = label.indexOf('⎿');
-      if (arrow >= 0) label = label.slice(0, arrow);
-      label = label.replace(/\\s+/g, ' ').trim();
-      // Bypass-permissions banner shows up as a ❯ block sandwiched between
-      // box-drawing rules. Skip entries whose content is just decorative.
+      var raw = (prompts[i].textContent || '').trim();
+      // .user-prompt wraps only the user's question (prompt span) or the
+      // bashTool summary — no slash-command output bleeds in, so the label
+      // needs no ⎿ slicing. Just strip the leading marker.
+      var label = raw.replace(/^[❯!]\\s*/, '').replace(/\\s+/g, ' ').trim();
+      // Bypass-permissions banner renders as a ❯ block sandwiched between
+      // box-drawing rules. Skip entries whose content is purely decorative.
       if (!label || /^─/.test(label)) continue;
       var item = document.createElement('a');
       item.className = 'ccs-menu-item';
