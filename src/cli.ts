@@ -21,6 +21,14 @@ function parseWidths(input: string, charPx: number, rows: number): WidthSpec[] {
     .map((s) => s.trim())
     .filter(Boolean)
     .map((s) => {
+      // Column-based form: "<n>c" or "<n>cx<rows>" — pin tmux to exactly that
+      // many columns, derive the HTML pixel bucket as cols * charPx.
+      const mc = s.match(/^(\d+)c(?:x(\d+))?$/);
+      if (mc) {
+        const cols = parseInt(mc[1], 10);
+        const rs = mc[2] ? parseInt(mc[2], 10) : rows;
+        return { px: Math.round(cols * charPx), cols, rows: rs };
+      }
       const m = s.match(/^(\d+)(?:x(\d+))?$/);
       if (!m) throw new Error(`invalid width spec: ${s}`);
       const px = parseInt(m[1], 10);
@@ -115,22 +123,37 @@ async function pageToEnd(
 }
 
 /**
- * Capture the visible pane while paging up. Returns frames in chronological
- * order (oldest first). Assumes Claude is at the bottom of its detailed
- * transcript view when called.
+ * Scroll to the top of the current view, then PageDown one screen at a time,
+ * capturing each visible page. Returns frames in chronological order (oldest
+ * first — i.e. the top page is frame 0). Caller can be at any scroll position
+ * when this is invoked; the initial PageUp-to-top normalises it.
+ *
+ * When `debug` is set, each captured page is also written as raw ANSI to
+ * `<debug.dir>/<debug.label>_p<idx>.ansi`.
  */
-async function capturePagesUp(
+async function capturePagesDown(
   tmux: Tmux,
   name: string,
-  pollMs: number
+  pollMs: number,
+  debug?: { dir: string; label: string }
 ): Promise<{ frames: string[]; scrolled: number }> {
-  const frames: string[] = [tmux.capturePaneVisible(name, true)];
+  const writeDebug = (idx: number, ansi: string) => {
+    if (!debug) return;
+    const file = path.join(debug.dir, `${debug.label}_p${idx}.ansi`);
+    fs.writeFileSync(file, ansi);
+  };
+
+  await pageToEnd(tmux, name, "PageUp", pollMs);
+
+  const first = tmux.capturePaneVisible(name, true);
+  const frames: string[] = [first];
+  writeDebug(0, first);
   let lastPlain = tmux.capturePaneVisible(name, false);
   let stable = 0;
   let scrolled = 0;
   const MAX = 500;
   for (let p = 0; p < MAX; p++) {
-    tmux.sendKeys(name, "PageUp");
+    tmux.sendKeys(name, "PageDown");
     await new Promise((r) => setTimeout(r, pollMs));
     const plain = tmux.capturePaneVisible(name, false);
     if (plain === lastPlain) {
@@ -140,10 +163,12 @@ async function capturePagesUp(
     }
     stable = 0;
     lastPlain = plain;
-    frames.push(tmux.capturePaneVisible(name, true));
+    const ansi = tmux.capturePaneVisible(name, true);
+    frames.push(ansi);
+    writeDebug(frames.length - 1, ansi);
     scrolled++;
   }
-  return { frames: frames.reverse(), scrolled };
+  return { frames, scrolled };
 }
 
 function findOverlap(prev: string, cur: string): number {
@@ -179,6 +204,7 @@ async function captureWidth(opts: {
   claudeBin: string;
   cwd: string;
   log: (s: string) => void;
+  debugDir?: string;
 }): Promise<{ snapshots: Snapshot[]; paneTitle: string }> {
   const name = sessionName(opts.sessionId, opts.spec.px);
   if (opts.tmux.hasSession(name)) opts.tmux.killSession(name);
@@ -223,39 +249,38 @@ async function captureWidth(opts: {
       maxWaitMs: opts.maxWaitMs,
     });
 
-    // Both snapshots come from Claude's detailed-transcript view (Ctrl+O),
-    // paged with PgUp from the bottom up. snap 0 captures the compact view;
-    // snap 1 sends Ctrl+E first to expand every tool output. We need to be
-    // at the *bottom* of the transcript before each capture cycle so PgUp
-    // actually walks the whole history.
-    opts.tmux.sendKeys(name, "C-o");
-    await waitForStable(opts.tmux, name, {
-      stableMs: opts.stableMs,
-      pollMs: opts.pollMs,
-      maxWaitMs: opts.maxWaitMs,
-    });
-
+    // snap 0: Claude's regular view with only Esc pressed.
+    // snap 1: same session toggled into the detailed-transcript view (Ctrl+O).
+    // Each snapshot scrolls to the very top and pages down one screen at a
+    // time, so frames come out in chronological (oldest-first) order. No
+    // Ctrl+E — we don't expand tool outputs.
     for (let i = 0; i < opts.snapshots; i++) {
       if (i === 1) {
-        // Snap 0 left us at the top. Scroll back to the bottom, expand all
-        // entries with Ctrl+E, then re-page from the (possibly shifted) bottom.
-        await pageToEnd(opts.tmux, name, "PageDown", opts.pollMs);
-        opts.tmux.sendKeys(name, "C-e");
+        // Toggle into the detailed-transcript view. capturePagesDown's
+        // initial PageUp-to-top handles whatever scroll position Claude
+        // leaves us in.
+        opts.tmux.sendKeys(name, "C-o");
         await waitForStable(opts.tmux, name, {
           stableMs: opts.stableMs,
           pollMs: opts.pollMs,
           maxWaitMs: opts.maxWaitMs,
         });
-        await pageToEnd(opts.tmux, name, "PageDown", opts.pollMs);
       }
 
-      const { frames, scrolled } = await capturePagesUp(
+      const debug = opts.debugDir
+        ? {
+            dir: opts.debugDir,
+            label: `${opts.sessionId}_w${opts.spec.px}_s${i}`,
+          }
+        : undefined;
+      const { frames, scrolled } = await capturePagesDown(
         opts.tmux,
         name,
-        opts.pollMs
+        opts.pollMs,
+        debug
       );
       opts.log(
-        `[w=${opts.spec.px}] snapshot ${i}: ${scrolled} PageUps, ${frames.length} pages`
+        `[w=${opts.spec.px}] snapshot ${i}: ${scrolled} PageDowns, ${frames.length} pages`
       );
 
       const ordered = frames.map(trimPaneFrame);
@@ -302,8 +327,8 @@ async function main() {
     .option("-o, --out <path>", "output html file or directory (default: <sessionId>.html in $PWD)")
     .option(
       "--widths <list>",
-      "comma-separated pixel widths (each may be NxROWS)",
-      "360,720,1080"
+      "comma-separated widths. Each item is either pixel width ('720', '720x800') or column count with 'c' suffix ('50c', '50cx800').",
+      "50c,100c"
     )
     .option("--char-px <n>", "approx monospace char width in px (Menlo 14px ≈ 8.43)", "8.5")
     .option(
@@ -320,6 +345,10 @@ async function main() {
     .option("--cwd <dir>", "working directory for the tmux process (default: $PWD)", pwd)
     .option("--history-limit <n>", "tmux history-limit (lines of scrollback)", "1000000")
     .option("--socket <name>", "tmux -L socket name", "claude-code-share")
+    .option(
+      "--debug-dir <path>",
+      "if set, dump raw ANSI of each captured page to this directory (one file per PageUp)"
+    )
     .option("--quiet", "suppress progress logs")
     .parse(process.argv);
 
@@ -337,6 +366,7 @@ async function main() {
     cwd: string;
     historyLimit: string;
     socket: string;
+    debugDir?: string;
     quiet?: boolean;
   }>();
 
@@ -358,6 +388,12 @@ async function main() {
     : path.join(pwd, `${sessionId}.html`);
   const log = opts.quiet ? () => {} : (s: string) => console.error(s);
 
+  const debugDir = opts.debugDir ? path.resolve(pwd, opts.debugDir) : undefined;
+  if (debugDir) {
+    fs.mkdirSync(debugDir, { recursive: true });
+    log(`[claude-code-share] dumping raw ANSI pages to ${debugDir}`);
+  }
+
   const widths = parseWidths(opts.widths, parseFloat(opts.charPx), parseInt(opts.rows, 10));
 
   const tmux = new Tmux(opts.socket);
@@ -378,6 +414,7 @@ async function main() {
         claudeBin: opts.claude,
         cwd: opts.cwd,
         log,
+        debugDir,
       });
       all.push(...result.snapshots);
       if (!title && result.paneTitle) title = result.paneTitle;
