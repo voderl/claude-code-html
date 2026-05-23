@@ -15,7 +15,10 @@ interface ColsSpec {
 // Used only to derive responsive breakpoints from --cols for the HTML output.
 const CHAR_PX = 8.5;
 
-function parseCols(input: string, rows: number): ColsSpec[] {
+// Default tmux pane rows. Each --cols entry can still override per-spec via NxROWS.
+const DEFAULT_ROWS = 40;
+
+function parseCols(input: string): ColsSpec[] {
   return input
     .split(",")
     .map((s) => s.trim())
@@ -24,7 +27,7 @@ function parseCols(input: string, rows: number): ColsSpec[] {
       const m = s.match(/^(\d+)(?:x(\d+))?$/);
       if (!m) throw new Error(`invalid cols spec: ${s}`);
       const cols = parseInt(m[1], 10);
-      const rs = m[2] ? parseInt(m[2], 10) : rows;
+      const rs = m[2] ? parseInt(m[2], 10) : DEFAULT_ROWS;
       return { cols, rows: rs, px: Math.round(cols * CHAR_PX) };
     });
 }
@@ -67,6 +70,7 @@ async function captureSession(opts: {
   sessionId: string;
   specs: ColsSpec[];
   stableMs: number;
+  settleMs: number;
   pollMs: number;
   maxWaitMs: number;
   claudeBin: string;
@@ -104,6 +108,12 @@ async function captureSession(opts: {
   const wait = () =>
     waitForStable(opts.tmux, name, {
       stableMs: opts.stableMs,
+      pollMs: opts.pollMs,
+      maxWaitMs: opts.maxWaitMs,
+    });
+  const settle = () =>
+    waitForStable(opts.tmux, name, {
+      stableMs: opts.settleMs,
       pollMs: opts.pollMs,
       maxWaitMs: opts.maxWaitMs,
     });
@@ -145,17 +155,16 @@ async function captureSession(opts: {
       const tag = `[cols=${spec.cols}]`;
 
       if (i > 0) {
-        opts.log(`${tag} resizing to ${spec.cols}x${spec.rows}`);
         opts.tmux.sendKeys(name, "Escape");
-        await wait();
+        await settle();
         opts.tmux.resizeWindow(name, spec.cols, spec.rows);
-        await wait();
+        await settle();
       } else {
         opts.tmux.sendKeys(name, "Escape");
-        await wait();
+        await settle();
       }
       opts.tmux.sendKeys(name, "C-o");
-      await wait();
+      await settle();
       opts.tmux.clearHistory(name);
       opts.tmux.sendKeys(name, "[");
       await wait();
@@ -206,13 +215,13 @@ async function main() {
     .option("-o, --out <path>", "output html file or directory (default: <sessionId>.html in $PWD)")
     .option(
       "--cols <list>",
-      "comma-separated tmux column counts (each item may be NxROWS to override rows). One HTML responsive breakpoint per entry.",
+      `comma-separated tmux column counts (each item may be NxROWS to override the default ${DEFAULT_ROWS} rows). One HTML responsive breakpoint per entry.`,
       "120,80,40"
     )
-    .option("--rows <n>", "default tmux pane rows when an entry has no xROWS", "100")
-    .option("--stable-ms <n>", "ms of stable content before considering ready", "1500")
-    .option("--max-wait-ms <n>", "max wait per stable cycle", "20000")
-    .option("--poll-ms <n>", "poll interval", "250")
+    .option("--stable-ms <n>", "ms of stable content before considering ready (used for initial render and the `[` transcript flush)", "1000")
+    .option("--settle-ms <n>", "ms of stable content for lightweight key transitions (Esc / C-o / resize)", "100")
+    .option("--max-wait-ms <n>", "max wait per stable cycle", "10000")
+    .option("--poll-ms <n>", "poll interval", "100")
     .option("--font-px <n>", "rendered font-size in HTML", "14")
     .option("--claude <bin>", "claude binary", "claude")
     .option("--cwd <dir>", "working directory for the tmux process (default: $PWD)", pwd)
@@ -228,8 +237,8 @@ async function main() {
   const opts = program.opts<{
     out?: string;
     cols: string;
-    rows: string;
     stableMs: string;
+    settleMs: string;
     maxWaitMs: string;
     pollMs: string;
     fontPx: string;
@@ -265,7 +274,7 @@ async function main() {
     log(`[claude-code-share] dumping raw ANSI to ${debugDir}`);
   }
 
-  const specs = parseCols(opts.cols, parseInt(opts.rows, 10));
+  const specs = parseCols(opts.cols);
 
   const tmux = new Tmux(opts.socket);
   tmux.setupServer(parseInt(opts.historyLimit, 10));
@@ -278,6 +287,7 @@ async function main() {
       sessionId,
       specs,
       stableMs: parseInt(opts.stableMs, 10),
+      settleMs: parseInt(opts.settleMs, 10),
       pollMs: parseInt(opts.pollMs, 10),
       maxWaitMs: parseInt(opts.maxWaitMs, 10),
       claudeBin: opts.claude,
