@@ -170,6 +170,22 @@ export class Tmux {
   sendKeys(name: string, ...keys: string[]): void {
     this.run(["send-keys", "-t", name, ...keys], { check: true });
   }
+
+  /** Drop the pane's scrollback so the next capture starts from an empty buffer. */
+  clearHistory(name: string): void {
+    this.run(["clear-history", "-t", name], { check: true });
+  }
+
+  /**
+   * Resize the window holding this session's pane. The TUI inside receives
+   * SIGWINCH and re-lays out to the new dimensions.
+   */
+  resizeWindow(name: string, cols: number, rows: number): void {
+    this.run(
+      ["resize-window", "-t", name, "-x", String(cols), "-y", String(rows)],
+      { check: true }
+    );
+  }
 }
 
 export function sleep(ms: number): Promise<void> {

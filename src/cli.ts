@@ -29,8 +29,8 @@ function parseCols(input: string, rows: number): ColsSpec[] {
     });
 }
 
-function sessionName(sessionId: string, cols: number): string {
-  return `ccs_${sessionId.slice(0, 8)}_${cols}c`;
+function sessionName(sessionId: string): string {
+  return `ccs_${sessionId.slice(0, 8)}`;
 }
 
 const ANSI_RE = /\x1b\[[\d;]*[a-zA-Z]/g;
@@ -62,10 +62,10 @@ function trimPaneFrame(page: string): string {
   return lines.slice(0, bottom).join("\n");
 }
 
-async function captureWidth(opts: {
+async function captureSession(opts: {
   tmux: Tmux;
   sessionId: string;
-  spec: ColsSpec;
+  specs: ColsSpec[];
   stableMs: number;
   pollMs: number;
   maxWaitMs: number;
@@ -74,19 +74,19 @@ async function captureWidth(opts: {
   log: (s: string) => void;
   debugDir?: string;
 }): Promise<{ snapshots: Snapshot[]; paneTitle: string }> {
-  const name = sessionName(opts.sessionId, opts.spec.cols);
+  const name = sessionName(opts.sessionId);
   if (opts.tmux.hasSession(name)) opts.tmux.killSession(name);
 
   const cmd = [opts.claudeBin, "--resume", opts.sessionId];
-  const tag = `[cols=${opts.spec.cols}]`;
+  const first = opts.specs[0];
 
   opts.log(
-    `${tag} starting tmux session ${name} (${opts.spec.cols}x${opts.spec.rows})`
+    `starting tmux session ${name} (${first.cols}x${first.rows})`
   );
   opts.tmux.newDetachedSession({
     name,
-    cols: opts.spec.cols,
-    rows: opts.spec.rows,
+    cols: first.cols,
+    rows: first.rows,
     cwd: opts.cwd,
     command: cmd,
     env: {
@@ -108,10 +108,11 @@ async function captureWidth(opts: {
       maxWaitMs: opts.maxWaitMs,
     });
 
+  const snapshots: Snapshot[] = [];
   let paneTitle = "";
-  let trimmed = "";
+
   try {
-    opts.log(`${tag} waiting for initial render to settle...`);
+    opts.log(`waiting for initial render to settle...`);
     await wait();
 
     // If claude exited before producing a transcript (e.g. bad/empty session
@@ -129,43 +130,58 @@ async function captureWidth(opts: {
       while (lines.length && lines[lines.length - 1] === "") lines.pop();
       const out = lines.join("\n");
       throw new Error(
-        `${tag} claude exited before the transcript was ready. Its output:\n` +
+        `claude exited before the transcript was ready. Its output:\n` +
           (out || "(no output)")
       );
     }
 
-    // Esc → C-o → `[` asks Claude to flush every transcript row into the
-    // pane (and therefore tmux's scrollback) in one pass. Once the buffer
-    // stops changing, a single capture-pane reads the whole thing — no
-    // paging, no frame stitching.
-    opts.tmux.sendKeys(name, "Escape");
-    await wait();
-    opts.tmux.sendKeys(name, "C-o");
-    await wait();
-    opts.tmux.sendKeys(name, "[");
-    await wait();
+    // One claude process; for each width we trigger the transcript flush
+    // (Esc → C-o → `[`), capture, then exit the transcript view, clear
+    // scrollback, and resize before the next iteration. Esc serves double
+    // duty on later iterations: it leaves the transcript view we just
+    // captured so the resize+redraw happens against Claude's normal UI.
+    for (let i = 0; i < opts.specs.length; i++) {
+      const spec = opts.specs[i];
+      const tag = `[cols=${spec.cols}]`;
 
-    const ansi = opts.tmux.capturePane(name, true);
-    paneTitle = opts.tmux.paneTitle(name);
+      if (i > 0) {
+        opts.log(`${tag} resizing to ${spec.cols}x${spec.rows}`);
+        opts.tmux.sendKeys(name, "Escape");
+        await wait();
+        opts.tmux.resizeWindow(name, spec.cols, spec.rows);
+        await wait();
+      } else {
+        opts.tmux.sendKeys(name, "Escape");
+        await wait();
+      }
+      opts.tmux.sendKeys(name, "C-o");
+      await wait();
+      opts.tmux.clearHistory(name);
+      opts.tmux.sendKeys(name, "[");
+      await wait();
 
-    if (opts.debugDir) {
-      const file = path.join(
-        opts.debugDir,
-        `${opts.sessionId}_c${opts.spec.cols}.ansi`
-      );
-      fs.writeFileSync(file, ansi);
-      opts.log(`${tag} wrote ${file}`);
+      const ansi = opts.tmux.capturePane(name, true);
+      if (!paneTitle) paneTitle = opts.tmux.paneTitle(name);
+
+      if (opts.debugDir) {
+        const file = path.join(
+          opts.debugDir,
+          `${opts.sessionId}_c${spec.cols}.ansi`
+        );
+        fs.writeFileSync(file, ansi);
+        opts.log(`${tag} wrote ${file}`);
+      }
+
+      const trimmed = trimPaneFrame(ansi);
+      opts.log(`${tag} captured ${trimmed.split("\n").length} lines`);
+      if (trimmed) {
+        snapshots.push({ width: spec.px, cols: spec.cols, index: 0, ansi: trimmed });
+      }
     }
-
-    trimmed = trimPaneFrame(ansi);
-    opts.log(`${tag} captured ${trimmed.split("\n").length} lines`);
   } finally {
     if (opts.tmux.hasSession(name)) opts.tmux.killSession(name);
   }
 
-  const snapshots: Snapshot[] = trimmed
-    ? [{ width: opts.spec.px, cols: opts.spec.cols, index: 0, ansi: trimmed }]
-    : [];
   return { snapshots, paneTitle };
 }
 
@@ -191,9 +207,9 @@ async function main() {
     .option(
       "--cols <list>",
       "comma-separated tmux column counts (each item may be NxROWS to override rows). One HTML responsive breakpoint per entry.",
-      "50,100"
+      "120,80,40"
     )
-    .option("--rows <n>", "default tmux pane rows when an entry has no xROWS", "1000")
+    .option("--rows <n>", "default tmux pane rows when an entry has no xROWS", "100")
     .option("--stable-ms <n>", "ms of stable content before considering ready", "1500")
     .option("--max-wait-ms <n>", "max wait per stable cycle", "20000")
     .option("--poll-ms <n>", "poll interval", "250")
@@ -257,22 +273,20 @@ async function main() {
   const all: Snapshot[] = [];
   let title = "";
   try {
-    for (const spec of specs) {
-      const result = await captureWidth({
-        tmux,
-        sessionId,
-        spec,
-        stableMs: parseInt(opts.stableMs, 10),
-        pollMs: parseInt(opts.pollMs, 10),
-        maxWaitMs: parseInt(opts.maxWaitMs, 10),
-        claudeBin: opts.claude,
-        cwd: opts.cwd,
-        log,
-        debugDir,
-      });
-      all.push(...result.snapshots);
-      if (!title && result.paneTitle) title = result.paneTitle;
-    }
+    const result = await captureSession({
+      tmux,
+      sessionId,
+      specs,
+      stableMs: parseInt(opts.stableMs, 10),
+      pollMs: parseInt(opts.pollMs, 10),
+      maxWaitMs: parseInt(opts.maxWaitMs, 10),
+      claudeBin: opts.claude,
+      cwd: opts.cwd,
+      log,
+      debugDir,
+    });
+    all.push(...result.snapshots);
+    if (result.paneTitle) title = result.paneTitle;
   } finally {
     // Tear down our private server so we don't leave it lingering.
     tmux.killServer();
