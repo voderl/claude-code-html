@@ -184,7 +184,7 @@ async function captureSession(opts: {
       const trimmed = trimPaneFrame(ansi);
       opts.log(`${tag} captured ${trimmed.split("\n").length} lines`);
       if (trimmed) {
-        snapshots.push({ width: spec.px, cols: spec.cols, index: 0, ansi: trimmed });
+        snapshots.push({ width: spec.px, cols: spec.cols, ansi: trimmed });
       }
     }
   } finally {

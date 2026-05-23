@@ -4,7 +4,6 @@ import { cleanAnsi, segmentAnsi, Segment } from "./segment";
 export interface Snapshot {
   width: number; // pixel bucket
   cols: number; // tmux column count used at capture
-  index: number; // 0 = initial (post-ESC), 1 = post-Ctrl+O, ...
   ansi: string; // already-trimmed ANSI from tmux capture-pane -e
 }
 
@@ -265,8 +264,9 @@ export interface BuildHtmlOpts {
  *     the buckets it isn't currently showing.
  *   - JS picks the largest template whose data-w ≤ window.innerWidth and clones
  *     its content into <div id="snap">. On resize it re-clones.
- *   - Ctrl+O cycles the active .snapshot div within the cloned content. The
- *     cycle index is preserved across resize-driven re-clones.
+ *   - Ctrl+O toggles the global view mode (preview ↔ detail); Ctrl+E toggles
+ *     whether each individual tool call is expanded. State survives the
+ *     resize-driven re-clone.
  */
 export function buildHtml(opts: BuildHtmlOpts): string {
   const { sessionId, snapshots } = opts;
@@ -278,24 +278,17 @@ export function buildHtml(opts: BuildHtmlOpts): string {
   if (!title) title = `Claude Code Session ${sessionId}`;
 
   const widths = uniqSorted(snapshots.map((s) => s.width));
-  const snapIdx = uniqSorted(snapshots.map((s) => s.index));
 
   const classifier = new StyleClassifier();
   let templates = "";
   for (const w of widths) {
-    const cols = snapshots.find((s) => s.width === w)?.cols ?? 0;
-    let inner = "";
-    for (const idx of snapIdx) {
-      const snap = snapshots.find((s) => s.index === idx && s.width === w);
-      if (!snap) continue;
-      const cls = idx === snapIdx[0] ? "snapshot active" : "snapshot";
-      const body = renderAnsi(snap.ansi, classifier);
-      // Expose the capture's column count as a CSS variable so .tool's
-      // ellipsis cap (max-width: var(--cols)) matches the exported pane
-      // width — e.g. a 50-col snapshot caps tool summaries at 50ch.
-      inner += `<div class="${cls}" data-snapshot="${idx}" style="--cols:${snap.cols}ch">${body}</div>`;
-    }
-    templates += `<template data-w="${w}" data-cols="${cols}">${inner}</template>\n`;
+    const snap = snapshots.find((s) => s.width === w);
+    if (!snap) continue;
+    // Expose the capture's column count as a CSS variable so .tool's
+    // ellipsis cap (max-width: var(--cols)) matches the exported pane
+    // width — e.g. a 50-col snapshot caps tool summaries at 50ch.
+    const inner = `<div class="snapshot" style="--cols:${snap.cols}ch">${renderAnsi(snap.ansi, classifier)}</div>`;
+    templates += `<template data-w="${w}" data-cols="${snap.cols}">${inner}</template>\n`;
   }
 
   return `<!DOCTYPE html>
@@ -322,8 +315,6 @@ body {
   font-variant-ligatures: none;
 }
 .terminal { white-space: pre; margin: 0; tab-size: 4; }
-.snapshot { display: none; }
-.snapshot.active { display: block; }
 /* CJK runs render inside an inline-block whose width is class-driven
    (.cjk picks up width:Nch from the deduped style classes). text-justify:
    inter-character distributes the run across the slot. The 2px horizontal
@@ -425,8 +416,7 @@ details.tool-group[open] > summary.tool-group-summary { display: none; }
 .hint b { color: #fff; }
 /* Prompt-jump menu — top-right hamburger that opens a list of the user's
    prompts. Each item is the prompt's textContent, ellipsized, and clicking
-   one scrolls to that prompt's <span class="user-prompt"> in the active
-   snapshot. */
+   one scrolls to that prompt's <span class="user-prompt">. */
 .ccs-menu {
   position: fixed; top: 10px; right: 12px; z-index: 10;
   font: 12px/1.4 ui-monospace, monospace;
@@ -511,14 +501,6 @@ ${templates}<div id="snap"></div>
     var tpl = document.querySelector('template[data-w="' + w + '"]');
     snap.textContent = '';
     snap.appendChild(tpl.content.cloneNode(true));
-    apply();
-  }
-  function apply() {
-    var snaps = snap.querySelectorAll('.snapshot');
-    for (var i = 0; i < snaps.length; i++) {
-      if (i === 0) snaps[i].classList.add('active');
-      else snaps[i].classList.remove('active');
-    }
     applyMode();
   }
   function applyMode() {
@@ -553,8 +535,7 @@ ${templates}<div id="snap"></div>
     applyMode();
   }
   function buildMenu() {
-    var activeSnap = snap.querySelector('.snapshot.active') || snap;
-    var prompts = activeSnap.querySelectorAll('.user-prompt');
+    var prompts = snap.querySelectorAll('.user-prompt');
     menuList.textContent = '';
     if (!prompts.length) {
       var empty = document.createElement('div');
