@@ -139,10 +139,19 @@ export function segmentAnsi(ansi: string): Segment[] {
       segs.push({ kind: "prompt", ansi: cmdBuf.join("\n") });
       pushGap(trail);
     } else {
-      // Green ⏺ without ⎿ — unusual, render as plain so nothing is lost.
       const trail = peelTrailing(cmdBuf);
-      segs.push({ kind: "plain", ansi: cmdBuf.join("\n") });
-      pushGap(trail);
+      const stripped = cmdBuf.join("\n").replace(SGR_RE, "").trim();
+      if (stripped === "⏺") {
+        // Claude Code emits bare ⏺ bullets for transcript entries it doesn't
+        // expand (TodoWrite updates, internal tool calls). They carry no
+        // information once captured — drop the glyph and its trailing blank
+        // so it doesn't render as a stray "⏺" floating between real segments.
+      } else {
+        // Green ⏺ with content but no ⎿ — unusual, render as plain so
+        // nothing is lost.
+        segs.push({ kind: "plain", ansi: cmdBuf.join("\n") });
+        pushGap(trail);
+      }
     }
     blockKind = "";
     cmdBuf = [];

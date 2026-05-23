@@ -223,6 +223,11 @@ async function main() {
     .option("--max-wait-ms <n>", "max wait per stable cycle", "10000")
     .option("--poll-ms <n>", "poll interval", "100")
     .option("--font-px <n>", "rendered font-size in HTML", "14")
+    .option(
+      "--mode <mode>",
+      "initial fold state: 'preview' (every tool/tool-group <details> collapsed) or 'detail' (everything expanded). URL ?mode=preview|detail overrides this at view time.",
+      "preview"
+    )
     .option("--claude <bin>", "claude binary", "claude")
     .option("--cwd <dir>", "working directory for the tmux process (default: $PWD)", pwd)
     .option("--history-limit <n>", "tmux history-limit (lines of scrollback)", "1000000")
@@ -242,6 +247,7 @@ async function main() {
     maxWaitMs: string;
     pollMs: string;
     fontPx: string;
+    mode: string;
     claude: string;
     cwd: string;
     historyLimit: string;
@@ -308,11 +314,17 @@ async function main() {
     process.exit(2);
   }
 
+  const modeArg = (opts.mode || "").toLowerCase();
+  const mode: "preview" | "detail" = modeArg === "detail" ? "detail" : "preview";
+  if (modeArg && modeArg !== "preview" && modeArg !== "detail") {
+    log(`[claude-code-share] unknown --mode '${opts.mode}', falling back to 'preview'`);
+  }
   const html = buildHtml({
     sessionId,
     snapshots: all,
     fontPx: parseInt(opts.fontPx, 10),
     title,
+    mode,
   });
 
   fs.writeFileSync(outPath, html);

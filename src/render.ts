@@ -1,5 +1,5 @@
 import { AnsiUp } from "ansi_up";
-import { cleanAnsi, segmentAnsi } from "./segment";
+import { cleanAnsi, segmentAnsi, Segment } from "./segment";
 
 export interface Snapshot {
   width: number; // pixel bucket
@@ -29,47 +29,107 @@ function ansiChunkToHtml(ansi: string, classifier: StyleClassifier): string {
 }
 
 /**
+ * Pull the tool name out of a tool segment so we can title group summaries.
+ * Tool calls render as `⏺ <Name>(...)` with the name in bold; bashTool is
+ * the user's `!` shortcut and we label it as "Bash" by convention.
+ */
+function toolName(seg: { kind: string; cmdAnsi: string }): string {
+  if (seg.kind === "bashTool") return "Bash";
+  const text = seg.cmdAnsi.replace(/\x1b\[[\d;]*[a-zA-Z]/g, "");
+  const m = text.match(/⏺\s+([A-Za-z][\w]*)/);
+  return m ? m[1] : "Tool";
+}
+
+function buildGroupSummary(tools: Array<{ kind: string; cmdAnsi: string }>): string {
+  const counts = new Map<string, number>();
+  for (const t of tools) {
+    const n = toolName(t);
+    counts.set(n, (counts.get(n) || 0) + 1);
+  }
+  const breakdown = Array.from(counts.entries())
+    .map(([n, c]) => `${escapeHtml(n)}×${c}`)
+    .join(", ");
+  return `▸ ${tools.length} tools hidden (${breakdown}), click or ctrl+o to expand`;
+}
+
+/**
  * Render a full snapshot's ANSI as the body of a `<pre class="terminal">`:
  * clean → segment at the ANSI level → emit each segment through ansi_up
  * separately. Tool blocks become inline `<details>`; user prompts and bash
  * runs become `<span class="user-prompt">`; gaps preserve the visual
- * whitespace between blocks.
+ * whitespace between blocks. Runs of ≥2 consecutive tool/bashTool segments
+ * (with optional gaps between) fold into a single `<details class="tool-group">`
+ * — collapsed by default in View mode and expanded en-masse in Detail mode.
  */
 export function renderAnsi(ansi: string, classifier: StyleClassifier): string {
   const segs = segmentAnsi(cleanAnsi(ansi));
   const parts: string[] = [];
   let promptIdx = 0;
-  for (const seg of segs) {
-    if (seg.kind === "plain") {
-      parts.push(ansiChunkToHtml(seg.ansi, classifier));
-    } else if (seg.kind === "prompt") {
-      parts.push(
-        `<span class="user-prompt" data-prompt-idx="${promptIdx++}">${ansiChunkToHtml(seg.ansi, classifier)}</span>`,
-      );
-    } else if (seg.kind === "agent") {
-      parts.push(
-        `<span class="agent-prompt">${ansiChunkToHtml(seg.ansi, classifier)}</span>`,
-      );
-    } else if (seg.kind === "tool") {
-      // Output sits inside an explicit .tool-out span so CSS can hide it
-      // when <details> is closed (display:inline details + native hiding
-      // of non-summary children is unreliable in browsers).
-      parts.push(
-        `<details class="tool"><summary>${ansiChunkToHtml(seg.cmdAnsi, classifier)}</summary><span class="tool-out">\n${ansiChunkToHtml(seg.outAnsi, classifier)}</span></details>`,
-      );
-    } else if (seg.kind === "bashTool") {
+
+  const renderOne = (seg: Segment): string => {
+    if (seg.kind === "plain") return ansiChunkToHtml(seg.ansi, classifier);
+    if (seg.kind === "prompt") {
+      return `<span class="user-prompt" data-prompt-idx="${promptIdx++}">${ansiChunkToHtml(seg.ansi, classifier)}</span>`;
+    }
+    if (seg.kind === "agent") {
+      return `<span class="agent-prompt">${ansiChunkToHtml(seg.ansi, classifier)}</span>`;
+    }
+    if (seg.kind === "tool") {
+      // Output sits inside .tool-out, but the *hiding* is delegated to the
+      // browser's user-agent rule on ::details-content — closed <details>
+      // hides its content via the native mechanism, which Chrome's find-in-
+      // page knows how to auto-expand. No explicit "\n" before the body:
+      // the block-level ::details-content wrapper already breaks the line
+      // between <summary> and the output.
+      return `<details class="tool"><summary>${ansiChunkToHtml(seg.cmdAnsi, classifier)}</summary><span class="tool-out">${ansiChunkToHtml(seg.outAnsi, classifier)}</span></details>`;
+    }
+    if (seg.kind === "bashTool") {
       // .user-prompt sits on the <summary> (not the <details>) so its
       // textContent is just the `! cmd` line — the menu can use it as the
       // title without scanning past the ⎿ output that follows inside.
-      parts.push(
-        `<details class="tool"><summary class="user-prompt" data-prompt-idx="${promptIdx++}">${ansiChunkToHtml(seg.cmdAnsi, classifier)}</summary><span class="tool-out">\n${ansiChunkToHtml(seg.outAnsi, classifier)}</span></details>`,
-      );
-    } else {
-      // gap.count N → N visible blank lines. Each parts[] entry is joined
-      // with one "\n", so N-1 explicit "\n" plus the two joining ones
-      // produces N+1 newlines between neighbours = N blanks.
-      parts.push("\n".repeat(Math.max(0, seg.count - 1)));
+      return `<details class="tool"><summary class="user-prompt" data-prompt-idx="${promptIdx++}">${ansiChunkToHtml(seg.cmdAnsi, classifier)}</summary><span class="tool-out">${ansiChunkToHtml(seg.outAnsi, classifier)}</span></details>`;
     }
+    // gap.count N → N visible blank lines. Each parts[] entry is joined
+    // with one "\n", so N-1 explicit "\n" plus the two joining ones
+    // produces N+1 newlines between neighbours = N blanks.
+    return "\n".repeat(Math.max(0, seg.count - 1));
+  };
+
+  let i = 0;
+  while (i < segs.length) {
+    const seg = segs[i];
+    if (seg.kind === "tool" || seg.kind === "bashTool") {
+      // Walk forward collecting consecutive tool/bashTool segments. Gaps
+      // between two tools are absorbed into the group (so they hide with
+      // the body); a trailing gap before a non-tool segment is *not* —
+      // it stays outside so the spacing before the next block survives.
+      const tools: Array<{ kind: string; cmdAnsi: string }> = [seg];
+      let j = i + 1;
+      let groupEnd = j;
+      while (j < segs.length) {
+        const s = segs[j];
+        if (s.kind === "tool" || s.kind === "bashTool") {
+          tools.push(s);
+          j++;
+          groupEnd = j;
+        } else if (s.kind === "gap") {
+          j++;
+        } else {
+          break;
+        }
+      }
+      if (tools.length >= 2) {
+        const inner: string[] = [];
+        for (let k = i; k < groupEnd; k++) inner.push(renderOne(segs[k]));
+        parts.push(
+          `<details class="tool-group"><summary class="tool-group-summary">${buildGroupSummary(tools)}</summary><span class="tool-group-body">${inner.join("\n")}</span></details>`,
+        );
+        i = groupEnd;
+        continue;
+      }
+    }
+    parts.push(renderOne(seg));
+    i++;
   }
   return `<pre class="terminal">${parts.join("\n")}</pre>`;
 }
@@ -191,6 +251,10 @@ export interface BuildHtmlOpts {
   snapshots: Snapshot[];
   fontPx?: number; // base monospace font size
   title?: string; // <title> (defaults to "Claude Code Session <sessionId>")
+  // Initial fold state. "preview" closes every <details> (matches the
+  // tool-group's "N tools hidden …" summary); "detail" expands everything.
+  // Defaults to "preview".
+  mode?: "preview" | "detail";
 }
 
 /**
@@ -207,6 +271,9 @@ export interface BuildHtmlOpts {
 export function buildHtml(opts: BuildHtmlOpts): string {
   const { sessionId, snapshots } = opts;
   const fontPx = opts.fontPx ?? 14;
+  // 'preview' = all <details> closed (only tool-group summaries visible);
+  // 'detail' = all <details> open. Falls back to 'preview' on any other value.
+  const buildMode: "preview" | "detail" = opts.mode === "detail" ? "detail" : "preview";
   let title = (opts.title ?? "").trim().replace(/^✳\s*/, "").trim();
   if (!title) title = `Claude Code Session ${sessionId}`;
 
@@ -309,14 +376,45 @@ details.tool:not([open]) > summary {
 }
 details.tool[open] > summary { background: rgba(255,255,255,0.03); }
 details.tool > summary:hover { background: rgba(255,255,255,0.06); }
-/* Make the ::details-content wrapper transparent so the .tool-out span sits
-   inline next to <summary>; without this, Chrome's default block-level
-   wrapper inserts a line break between the summary and the expanded body.
-   We trade Chrome's built-in "hide non-summary children when closed" for
-   the explicit .tool-out hide rule below. */
-details.tool::details-content { display: contents; }
-details.tool > .tool-out { display: inline; }
-details.tool:not([open]) > .tool-out { display: none; }
+/* Hiding of .tool-out is delegated to the user-agent ::details-content rule:
+   when <details> is closed, Chrome (and Firefox 131+/Safari 18.4+) hides the
+   content via the native mechanism. We deliberately do NOT override
+   ::details-content here — the native hiding is what makes Chrome's
+   find-in-page auto-expand work, even across nested <details>. */
+/* Tool-group: wraps a run of ≥2 adjacent tool calls so the whole run can
+   collapse behind a single summary in View mode. Same story as details.tool —
+   we let the user-agent ::details-content rule hide .tool-group-body when
+   closed, so Ctrl+F can search and auto-expand through both layers. */
+details.tool-group {
+  display: inline-block;
+  vertical-align: top;
+  max-width: var(--cols, 100ch);
+}
+details.tool-group > summary.tool-group-summary {
+  /* Sized to its content but capped at the capture's column count so the
+     dashed-box never spills past the pane edge — short breakdowns stay
+     tight, long ones ellipsis at --cols. */
+  display: inline-block;
+  max-width: var(--cols, 100ch);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer; list-style: none; outline: none;
+  color: #8a8a8a;
+  font-style: italic;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: rgba(255,255,255,0.04);
+  border: 1px dashed rgba(255,255,255,0.12);
+  user-select: none;
+}
+details.tool-group > summary.tool-group-summary::-webkit-details-marker { display: none; }
+details.tool-group > summary.tool-group-summary::marker { content: ""; }
+details.tool-group > summary.tool-group-summary:hover {
+  background: rgba(255,255,255,0.08);
+  color: #d0d0d0;
+}
+details.tool-group[open] > summary.tool-group-summary { display: none; }
 .hint {
   position: fixed; bottom: 10px; right: 12px;
   font: 11px/1.4 ui-monospace, monospace;
@@ -366,17 +464,40 @@ ${classifier.cssRules()}
 <body>
 ${templates}<div id="snap"></div>
 <div class="ccs-menu" id="ccs-menu"><button class="ccs-menu-btn" id="ccs-menu-btn" type="button" aria-label="提问列表">☰</button><div class="ccs-menu-list" id="ccs-menu-list"></div></div>
-<div class="hint" id="ccs-hint"><b id="ccs-idx">View</b> · <kbd>Ctrl</kbd>+<kbd>O</kbd> 切换</div>
+<div class="hint" id="ccs-hint"><b id="ccs-idx">${buildMode === "detail" ? "Detail" : "Preview"}</b> · <kbd>Ctrl</kbd>+<kbd>O</kbd> toggle<span id="ccs-tools-hint"${buildMode === "detail" ? "" : " hidden"}> · <kbd>Ctrl</kbd>+<kbd>E</kbd> to <span id="ccs-tools">expand</span> tool</span></div>
 <script>
 (function () {
   var widths = ${JSON.stringify(widths)};
   var snap = document.getElementById('snap');
   var idxEl = document.getElementById('ccs-idx');
+  var toolsEl = document.getElementById('ccs-tools');
+  var toolsHint = document.getElementById('ccs-tools-hint');
   var hint = document.getElementById('ccs-hint');
   var menu = document.getElementById('ccs-menu');
   var menuBtn = document.getElementById('ccs-menu-btn');
   var menuList = document.getElementById('ccs-menu-list');
-  var activeIdx = 0;
+  // 'preview' = every <details> closed (matches the "N tools hidden …"
+  // summary on tool-groups). 'detail' = every <details> open. Priority:
+  // URL ?mode=preview|detail > build-time --mode > built-in 'preview'.
+  // Case-insensitive on the URL value so ?mode=Detail also works.
+  // Persisted here so it survives snapshot/width re-clones (re-apply after
+  // every render()).
+  var buildMode = ${JSON.stringify(buildMode)};
+  function readInitialMode() {
+    try {
+      var v = (new URLSearchParams(location.search).get('mode') || '').toLowerCase();
+      if (v === 'preview') return 'preview';
+      if (v === 'detail') return 'detail';
+    } catch (e) {}
+    return buildMode;
+  }
+  var mode = readInitialMode();
+  // Detail-only fine-grain: do individual tool calls show their <details>
+  // body? Independent of mode; defaults to false (folded) so Detail mode
+  // first shows just the cmd lines and the user reaches Ctrl+E for the
+  // verbose output. Stays unset while in Preview (the parent tool-group
+  // hides everything anyway).
+  var toolsOpen = false;
   var curW = -1;
   function pickW() {
     var iw = window.innerWidth;
@@ -394,18 +515,42 @@ ${templates}<div id="snap"></div>
   }
   function apply() {
     var snaps = snap.querySelectorAll('.snapshot');
-    if (snaps.length <= 1 && hint) hint.style.display = 'none';
     for (var i = 0; i < snaps.length; i++) {
-      if (i === activeIdx) snaps[i].classList.add('active');
+      if (i === 0) snaps[i].classList.add('active');
       else snaps[i].classList.remove('active');
     }
-    if (idxEl && snaps[activeIdx]) idxEl.textContent = activeIdx === 0 ? 'View' : 'Detail';
+    applyMode();
   }
-  function cycle() {
-    var snaps = snap.querySelectorAll('.snapshot');
-    if (snaps.length <= 1) return;
-    activeIdx = (activeIdx + 1) % snaps.length;
-    apply();
+  function applyMode() {
+    // Two independent layers:
+    //   mode       → details.tool-group open/closed
+    //   toolsOpen  → each details.tool open/closed
+    // In Preview the inner tool state is moot (the group hides it), but
+    // we still set it so toggling out to Detail mode honours the user's
+    // most recent Ctrl+E choice.
+    var groups = snap.querySelectorAll('details.tool-group');
+    for (var i = 0; i < groups.length; i++) {
+      if (mode === 'preview') groups[i].removeAttribute('open');
+      else groups[i].setAttribute('open', '');
+    }
+    var tools = snap.querySelectorAll('details.tool');
+    for (var j = 0; j < tools.length; j++) {
+      if (toolsOpen) tools[j].setAttribute('open', '');
+      else tools[j].removeAttribute('open');
+    }
+    if (idxEl) idxEl.textContent = mode === 'detail' ? 'Detail' : 'Preview';
+    // Verb describes what Ctrl+E will do next: when tools are open, the
+    // hint says "to fold"; when collapsed, "to expand".
+    if (toolsEl) toolsEl.textContent = toolsOpen ? 'fold' : 'expand';
+    if (toolsHint) toolsHint.hidden = mode !== 'detail';
+  }
+  function cycleMode() {
+    mode = mode === 'preview' ? 'detail' : 'preview';
+    applyMode();
+  }
+  function cycleTools() {
+    toolsOpen = !toolsOpen;
+    applyMode();
   }
   function buildMenu() {
     var activeSnap = snap.querySelector('.snapshot.active') || snap;
@@ -435,6 +580,14 @@ ${templates}<div id="snap"></div>
       (function (target) {
         item.addEventListener('click', function (e) {
           e.preventDefault();
+          // Open any ancestor <details> (tool / tool-group) so the target
+          // has layout — otherwise scrollIntoView is a no-op on a hidden
+          // node inside a collapsed View-mode group.
+          var p = target.parentElement;
+          while (p) {
+            if (p.tagName === 'DETAILS' && !p.hasAttribute('open')) p.setAttribute('open', '');
+            p = p.parentElement;
+          }
           target.scrollIntoView({ behavior: 'smooth', block: 'start' });
           menu.classList.remove('open');
         });
@@ -464,9 +617,13 @@ ${templates}<div id="snap"></div>
   render();
   window.addEventListener('resize', render);
   document.addEventListener('keydown', function (e) {
-    if (e.ctrlKey && !e.metaKey && !e.altKey && (e.key === 'o' || e.key === 'O')) {
+    if (!(e.ctrlKey && !e.metaKey && !e.altKey)) return;
+    if (e.key === 'o' || e.key === 'O') {
       e.preventDefault();
-      cycle();
+      cycleMode();
+    } else if (e.key === 'e' || e.key === 'E') {
+      e.preventDefault();
+      cycleTools();
     }
   });
 })();
