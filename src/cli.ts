@@ -114,6 +114,26 @@ async function captureWidth(opts: {
     opts.log(`${tag} waiting for initial render to settle...`);
     await wait();
 
+    // If claude exited before producing a transcript (e.g. bad/empty session
+    // id), the pane is now dead. Surface whatever it printed instead of
+    // continuing to send keys and capture an empty frame.
+    if (opts.tmux.paneDead(name)) {
+      const lines = opts.tmux
+        .capturePane(name, false)
+        .split("\n")
+        .map((l) => l.replace(ANSI_RE, "").replace(/\s+$/, ""))
+        // tmux appends a footer like "Pane is dead (status 1, ...)" once the
+        // command exits with remain-on-exit on — drop it from the user-facing
+        // message; we already say claude exited.
+        .filter((l) => !/^Pane is dead \(status -?\d+/.test(l));
+      while (lines.length && lines[lines.length - 1] === "") lines.pop();
+      const out = lines.join("\n");
+      throw new Error(
+        `${tag} claude exited before the transcript was ready. Its output:\n` +
+          (out || "(no output)")
+      );
+    }
+
     // Esc → C-o → `[` asks Claude to flush every transcript row into the
     // pane (and therefore tmux's scrollback) in one pass. Once the buffer
     // stops changing, a single capture-pane reads the whole thing — no
@@ -278,6 +298,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(err && err.stack ? err.stack : err);
+  console.error(err instanceof Error ? err.message : String(err));
   process.exit(1);
 });

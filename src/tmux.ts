@@ -85,6 +85,12 @@ export class Tmux {
       `set-option -g visual-bell off`,
       `set-option -g visual-activity off`,
       `set-option -g status off`,
+      // Keep the pane (and its session) around after the spawned command exits
+      // so we can read whatever it printed. Without this, a fast-failing
+      // `claude --resume <bad-id>` destroys the session before we capture, and
+      // tmux exits with "no server running".
+      `set-window-option -g remain-on-exit on`,
+      `set-option -g exit-empty off`,
       // Permit fancy 24-bit color reporting.
       `set-option -ga terminal-overrides ",*256col*:Tc"`,
     ].join("\n") + "\n";
@@ -148,6 +154,17 @@ export class Tmux {
     const r = this.run(["display-message", "-p", "-t", name, "#{pane_title}"]);
     if (r.status !== 0) return "";
     return r.stdout.replace(/\r?\n$/, "");
+  }
+
+  /**
+   * True when the pane's command has exited but the pane is still held open by
+   * `remain-on-exit`. Used to detect e.g. `claude --resume <bad-id>` failing
+   * immediately, so we can surface its stderr instead of dying inside a poll.
+   */
+  paneDead(name: string): boolean {
+    const r = this.run(["display-message", "-p", "-t", name, "#{pane_dead}"]);
+    if (r.status !== 0) return false;
+    return r.stdout.trim() === "1";
   }
 
   sendKeys(name: string, ...keys: string[]): void {
