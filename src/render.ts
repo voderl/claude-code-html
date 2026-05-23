@@ -207,7 +207,8 @@ export interface BuildHtmlOpts {
 export function buildHtml(opts: BuildHtmlOpts): string {
   const { sessionId, snapshots } = opts;
   const fontPx = opts.fontPx ?? 14;
-  const title = (opts.title && opts.title.trim()) || `Claude Code Session ${sessionId}`;
+  let title = (opts.title ?? "").trim().replace(/^✳\s*/, "").trim();
+  if (!title) title = `Claude Code Session ${sessionId}`;
 
   const widths = uniqSorted(snapshots.map((s) => s.width));
   const snapIdx = uniqSorted(snapshots.map((s) => s.index));
@@ -236,6 +237,7 @@ export function buildHtml(opts: BuildHtmlOpts): string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(title)}</title>
+<link rel="icon" href="${faviconDataUrl()}">
 <style>
 :root { color-scheme: dark; }
 * { box-sizing: border-box; }
@@ -476,6 +478,11 @@ ${templates}<div id="snap"></div>
 
 function uniqSorted(xs: number[]): number[] {
   return Array.from(new Set(xs)).sort((a, b) => a - b);
+}
+
+function faviconDataUrl(): string {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><text x="32" y="32" dy=".35em" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="52" fill="#cc785c">✳</text></svg>`;
+  return `data:image/svg+xml,${encodeURIComponent(svg)}`;
 }
 
 function escapeHtml(s: string): string {
