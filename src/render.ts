@@ -24,7 +24,134 @@ function ansiChunkToHtml(ansi: string, classifier: StyleClassifier): string {
   html = wrapCJK(html);
   html = classifier.classify(html);
   html = mergeAdjacentSpans(html);
+  html = applyOsc8Links(html);
+  html = linkifyBareUrls(html);
   return html;
+}
+
+/**
+ * Mimic the terminal's Cmd+click behaviour: bare http(s) URLs in text get
+ * wrapped in <a target="_blank"> so they're clickable from the HTML too.
+ * We walk top-level tokens (tags vs text) and skip any text that's already
+ * inside an <a>, so OSC 8 links from applyOsc8Links() aren't double-wrapped.
+ *
+ * URL_RE only matches characters that are legal in a URI per RFC 3986 plus
+ * `[` / `]` for IPv6 hosts. This naturally stops at whitespace, CJK
+ * punctuation, fullwidth chars, HTML markers, etc. Trailing sentence punct
+ * (.,;:!?) is then peeled off so "see https://x.com." links to /x.com, not
+ * to "x.com.". The text we get is post-ansi_up, so `&` in a URL appears as
+ * `&amp;` — the regex consumes the whole entity (`&`, `a`, `m`, `p`, `;`
+ * are all in the char class) and we keep it escaped in both href and body.
+ */
+const URL_RE = /https?:\/\/[a-zA-Z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+/g;
+const SENTENCE_PUNCT = ".,;:!?";
+
+// Peel off trailing punctuation that's more likely sentence-level than URL.
+// `.,;:!?` always come off; `)` / `]` / `}` only come off when they don't
+// balance an opener in the URL itself — so the Wikipedia-style
+// "/wiki/Foo_(bar)" keeps its closing paren but "(see https://x.com)" drops it.
+function trimUrlTail(raw: string): { url: string; tail: string } {
+  let i = raw.length;
+  while (i > 0) {
+    const c = raw[i - 1];
+    if (SENTENCE_PUNCT.indexOf(c) !== -1) { i--; continue; }
+    if (c === ")" && countChar(raw, ")", i) > countChar(raw, "(", i)) { i--; continue; }
+    if (c === "]" && countChar(raw, "]", i) > countChar(raw, "[", i)) { i--; continue; }
+    if (c === "}" && countChar(raw, "}", i) > countChar(raw, "{", i)) { i--; continue; }
+    break;
+  }
+  return { url: raw.slice(0, i), tail: raw.slice(i) };
+}
+
+function countChar(s: string, ch: string, upTo: number): number {
+  let n = 0;
+  for (let i = 0; i < upTo; i++) if (s[i] === ch) n++;
+  return n;
+}
+
+function linkifyBareUrls(html: string): string {
+  const tokenRe = /<a\b[^>]*>|<\/a\s*>|<[^>]+>|[^<]+/gi;
+  let out = "";
+  let depth = 0;
+  let m: RegExpExecArray | null;
+  while ((m = tokenRe.exec(html)) !== null) {
+    const tok = m[0];
+    if (tok[0] === "<") {
+      if (/^<a\b/i.test(tok)) depth++;
+      else if (/^<\/a\b/i.test(tok)) depth = Math.max(0, depth - 1);
+      out += tok;
+    } else {
+      out += depth > 0 ? tok : linkifyText(tok);
+    }
+  }
+  return out;
+}
+
+function linkifyText(text: string): string {
+  return text.replace(URL_RE, (raw) => {
+    const { url, tail } = trimUrlTail(raw);
+    if (!url) return raw;
+    return `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>${tail}`;
+  });
+}
+
+/**
+ * cleanAnsi() left OSC 8 hyperlinks as `\x01<url>\x02` open markers and
+ * `\x01\x02` close markers in the text stream — they survived ansi_up + the
+ * style pipeline as plain text. Walk the markers in order: each open emits
+ * `<a target="_blank">`, each close emits `</a>`. OSC 8 isn't nestable per
+ * spec, so a re-open without a close implicitly closes the previous link;
+ * dangling opens at end-of-chunk get closed too. Unsafe schemes (javascript:,
+ * data:, …) drop the wrapper and render the contents as plain text.
+ *
+ * The URL has already been HTML-escaped by ansi_up, so it goes straight into
+ * the href attribute. Overlapping with surrounding <span> wrappers can happen
+ * when a single link's text spans multiple SGR colour changes; browsers handle
+ * that via the adoption-agency algorithm and the link still clicks correctly.
+ */
+function applyOsc8Links(html: string): string {
+  const re = /\x01([^\x02]*)\x02/g;
+  let result = "";
+  let lastEnd = 0;
+  let open = false;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    result += html.slice(lastEnd, m.index);
+    lastEnd = m.index + m[0].length;
+    const raw = m[1];
+    if (raw) {
+      if (open) {
+        result += "</a>";
+        open = false;
+      }
+      const href = safeHref(raw);
+      if (href) {
+        result += `<a href="${href}" target="_blank" rel="noopener noreferrer">`;
+        open = true;
+      }
+    } else if (open) {
+      result += "</a>";
+      open = false;
+    }
+  }
+  result += html.slice(lastEnd);
+  if (open) result += "</a>";
+  return result;
+}
+
+// Only http(s) URLs get the <a> wrapper. Everything else — local paths
+// (file://), javascript:, data:, custom schemes — renders as plain text.
+// Path-only URLs (e.g. "/foo") would be relative to the HTML file's
+// location, which isn't meaningful for these snapshots, so we skip those
+// too.
+const SAFE_SCHEME_RE = /^https?:/i;
+
+function safeHref(rawEscaped: string): string | null {
+  const url = rawEscaped.trim();
+  if (!url) return null;
+  if (/[\x00-\x1f]/.test(url)) return null;
+  if (!SAFE_SCHEME_RE.test(url)) return null;
+  return url;
 }
 
 /**
@@ -315,6 +442,10 @@ body {
   font-variant-ligatures: none;
 }
 .terminal { white-space: pre; margin: 0; tab-size: 4; }
+/* Links inherit the surrounding SGR colour/weight so they look identical to
+   plain text — only the hover underline reveals them. */
+.terminal a { color: inherit; text-decoration: none; }
+.terminal a:hover { text-decoration: underline; }
 /* CJK runs render inside an inline-block whose width is class-driven
    (.cjk picks up width:Nch from the deduped style classes). text-justify:
    inter-character distributes the run across the slot. The 2px horizontal

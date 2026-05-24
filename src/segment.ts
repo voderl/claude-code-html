@@ -1,12 +1,24 @@
-// Strip ANSI escape codes that ansi_up doesn't understand. OSC sequences
-// (hyperlinks like ESC ] 8 ; … ST) and non-SGR CSI (cursor positioning,
-// mode set/reset) leak as garbage text into the HTML if we leave them in.
+// Strip ANSI escape codes that ansi_up doesn't understand. Generic OSC
+// sequences (window title, mode set/reset) and non-SGR CSI (cursor
+// positioning) leak as garbage text into the HTML if we leave them in.
+//
+// OSC 8 (hyperlinks: ESC ] 8 ; params ; URI ST) is special — we want to
+// preserve the URL so render.ts can wrap the wrapped text in <a>. We
+// rewrite open sequences to "\x01<url>\x02" and close sequences (empty
+// URL) to "\x01\x02"; render.ts pairs them up after ansi_up runs. These
+// placeholders pass through ansi_up as plain text and don't trip any
+// segmentation rules (segment.ts classifies on the first VISIBLE glyph
+// and OSC 8 never starts a line in practice).
 const OSC_RE = /\x1b\][\s\S]*?(?:\x07|\x1b\\)/g;
+const OSC8_RE = /\x1b\]8;[^;]*;([^\x07\x1b]*)(?:\x07|\x1b\\)/g;
 const NON_SGR_CSI_RE = /\x1b\[\??[0-9;]*[hlABCDsuJKf]/g;
 const SGR_RE = /\x1b\[[\d;]*[a-zA-Z]/g;
 
 export function cleanAnsi(s: string): string {
-  return s.replace(OSC_RE, "").replace(NON_SGR_CSI_RE, "");
+  return s
+    .replace(OSC8_RE, (_m, url) => (url ? `\x01${url}\x02` : "\x01\x02"))
+    .replace(OSC_RE, "")
+    .replace(NON_SGR_CSI_RE, "");
 }
 
 function firstVisibleChar(line: string): string {
