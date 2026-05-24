@@ -49,11 +49,11 @@ function formatMissingSessionId(): string {
   const orange = (s: string) => sgr("38;5;173", s); // closest 256-colour match to Claude's ✳ (#cc785c)
   const bold = (s: string) => sgr("1", s);
   const bang = tty
-    ? `\x1b[38;5;211m!\x1b[0m \x1b[38;5;231mclaude-code-share\x1b[0m`
-    : `! claude-code-share`;
+    ? `\x1b[38;5;211m!\x1b[0m \x1b[38;5;231mclaude-code-html\x1b[0m`
+    : `! claude-code-html`;
   return [
     "",
-    `${orange("✳")} ${bold("claude-code-share needs a Claude Code session id.")}`,
+    `${orange("✳")} ${bold("claude-code-html needs a Claude Code session id.")}`,
     "",
     `  Run it in a Claude Code session:`,
     "",
@@ -228,7 +228,7 @@ async function main() {
 
   const program = new Command();
   program
-    .name("claude-code-share")
+    .name("claude-code-html")
     .description(
       "Capture a Claude Code session via tmux and render it as HTML.\n" +
         "If <sessionId> is omitted, falls back to $CLAUDE_CODE_SESSION_ID. " +
@@ -257,7 +257,7 @@ async function main() {
     .option("--claude <bin>", "claude binary", "claude")
     .option("--cwd <dir>", "working directory for the tmux process (default: $PWD)", pwd)
     .option("--history-limit <n>", "tmux history-limit (lines of scrollback)", "1000000")
-    .option("--socket <name>", "tmux -L socket name", "claude-code-share")
+    .option("--socket <name>", "tmux -L socket name", "claude-code-html")
     .option(
       "--debug-dir <path>",
       "if set, dump the raw ANSI capture for each --cols entry into this directory"
@@ -284,7 +284,7 @@ async function main() {
 
   const tmuxCheck = checkTmuxAvailable();
   if (!tmuxCheck.ok) {
-    console.error(`[claude-code-share] ${tmuxCheck.message}`);
+    console.error(`[claude-code-html] ${tmuxCheck.message}`);
     process.exit(1);
   }
 
@@ -301,7 +301,7 @@ async function main() {
   const debugDir = opts.debugDir ? path.resolve(pwd, opts.debugDir) : undefined;
   if (debugDir) {
     fs.mkdirSync(debugDir, { recursive: true });
-    log(`[claude-code-share] dumping raw ANSI to ${debugDir}`);
+    log(`[claude-code-html] dumping raw ANSI to ${debugDir}`);
   }
 
   const specs = parseCols(opts.cols);
@@ -334,14 +334,14 @@ async function main() {
   }
 
   if (all.length === 0) {
-    console.error("[claude-code-share] no snapshots captured.");
+    console.error("[claude-code-html] no snapshots captured.");
     process.exit(2);
   }
 
   const modeArg = (opts.mode || "").toLowerCase();
   const mode: "preview" | "detail" = modeArg === "detail" ? "detail" : "preview";
   if (modeArg && modeArg !== "preview" && modeArg !== "detail") {
-    log(`[claude-code-share] unknown --mode '${opts.mode}', falling back to 'preview'`);
+    log(`[claude-code-html] unknown --mode '${opts.mode}', falling back to 'preview'`);
   }
   const html = buildHtml({
     sessionId,
@@ -353,7 +353,7 @@ async function main() {
 
   fs.writeFileSync(outPath, html);
   log(
-    `[claude-code-share] wrote ${outPath} (${(Buffer.byteLength(html, "utf-8") / 1024).toFixed(1)} KB, ${all.length} snapshots)`
+    `[claude-code-html] wrote ${outPath} (${(Buffer.byteLength(html, "utf-8") / 1024).toFixed(1)} KB, ${all.length} snapshots)`
   );
 }
 

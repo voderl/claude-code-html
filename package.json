@@ -1,9 +1,9 @@
 {
-  "name": "claude-code-share",
+  "name": "claude-code-html",
   "version": "0.1.0",
-  "description": "Capture a Claude Code session via tmux and render it as a responsive, snapshot-toggleable HTML page.",
+  "description": "Capture a Claude Code session via tmux and render it as a responsive, self-contained HTML page.",
   "bin": {
-    "claude-code-share": "dist/cli.js"
+    "claude-code-html": "dist/cli.js"
   },
   "main": "dist/cli.js",
   "type": "commonjs",

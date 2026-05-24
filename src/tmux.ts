@@ -94,7 +94,7 @@ export class Tmux {
       // Permit fancy 24-bit color reporting.
       `set-option -ga terminal-overrides ",*256col*:Tc"`,
     ].join("\n") + "\n";
-    const file = path.join(os.tmpdir(), `claude-code-share-${process.pid}-${Date.now()}.tmux.conf`);
+    const file = path.join(os.tmpdir(), `claude-code-html-${process.pid}-${Date.now()}.tmux.conf`);
     fs.writeFileSync(file, conf, { mode: 0o600 });
     this.configFile = file;
   }
