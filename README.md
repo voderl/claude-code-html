@@ -39,6 +39,7 @@ Open the resulting `.html` in any browser. It's a single file — no assets, no 
 | `--claude <bin>` | `claude` | Path to the `claude` binary. |
 | `--cwd <dir>` | `$PWD` | Working directory for the resumed `claude` process. |
 | `--debug-dir <path>` | — | Dump the raw ANSI capture per `--cols` entry. |
+| `--no-mock-email` | (masking on) | Disable email masking. By default any email appearing before the first user turn (the Claude Code banner / account info) is replaced with `*` of the same length, keeping the `@`. |
 | `--quiet` | — | Suppress progress logs. |
 
 Run `claude-code-html --help` for the full list (timing knobs, tmux socket name, history limit, etc).

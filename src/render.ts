@@ -1,5 +1,5 @@
 import { AnsiUp } from "ansi_up";
-import { cleanAnsi, segmentAnsi, Segment } from "./segment";
+import { cleanAnsi, maskEmails, segmentAnsi, Segment } from "./segment";
 
 export interface Snapshot {
   width: number; // pixel bucket
@@ -187,8 +187,13 @@ function buildGroupSummary(tools: Array<{ kind: string; cmdAnsi: string }>): str
  * (with optional gaps between) fold into a single `<details class="tool-group">`
  * — collapsed by default in View mode and expanded en-masse in Detail mode.
  */
-export function renderAnsi(ansi: string, classifier: StyleClassifier): string {
+export function renderAnsi(
+  ansi: string,
+  classifier: StyleClassifier,
+  mockEmail = true,
+): string {
   const segs = segmentAnsi(cleanAnsi(ansi));
+  if (mockEmail) maskPreConversationEmails(segs);
   const parts: string[] = [];
   let promptIdx = 0;
 
@@ -258,6 +263,31 @@ export function renderAnsi(ansi: string, classifier: StyleClassifier): string {
     i++;
   }
   return `<pre class="terminal">${parts.join("\n")}</pre>`;
+}
+
+/**
+ * Mask emails in every segment that precedes the first user turn (a `prompt`
+ * or `bashTool` segment). The Claude Code startup banner shows the signed-in
+ * account email; this redacts it before it reaches the HTML, without touching
+ * any emails the user or agent intentionally typed inside the conversation.
+ */
+function maskPreConversationEmails(segs: Segment[]): void {
+  let cutoff = segs.length;
+  for (let i = 0; i < segs.length; i++) {
+    if (segs[i].kind === "prompt" || segs[i].kind === "bashTool") {
+      cutoff = i;
+      break;
+    }
+  }
+  for (let i = 0; i < cutoff; i++) {
+    const s = segs[i];
+    if (s.kind === "plain" || s.kind === "agent" || s.kind === "prompt") {
+      s.ansi = maskEmails(s.ansi);
+    } else if (s.kind === "tool" || s.kind === "bashTool") {
+      s.cmdAnsi = maskEmails(s.cmdAnsi);
+      s.outAnsi = maskEmails(s.outAnsi);
+    }
+  }
 }
 
 // CJK Unified Ideographs + extensions, Hiragana, Katakana, CJK Symbols and
@@ -381,6 +411,9 @@ export interface BuildHtmlOpts {
   // tool-group's "N tools hidden …" summary); "detail" expands everything.
   // Defaults to "preview".
   mode?: "preview" | "detail";
+  // Mask emails appearing before the first user turn (banner, account info)
+  // with `*` of equal length, keeping `@` literal. Defaults to true.
+  mockEmail?: boolean;
 }
 
 /**
@@ -401,6 +434,7 @@ export function buildHtml(opts: BuildHtmlOpts): string {
   // 'preview' = all <details> closed (only tool-group summaries visible);
   // 'detail' = all <details> open. Falls back to 'preview' on any other value.
   const buildMode: "preview" | "detail" = opts.mode === "detail" ? "detail" : "preview";
+  const mockEmail = opts.mockEmail !== false;
   let title = (opts.title ?? "").trim().replace(/^✳\s*/, "").trim();
   if (!title) title = `Claude Code Session ${sessionId}`;
 
@@ -414,7 +448,7 @@ export function buildHtml(opts: BuildHtmlOpts): string {
     // Expose the capture's column count as a CSS variable so .tool's
     // ellipsis cap (max-width: var(--cols)) matches the exported pane
     // width — e.g. a 50-col snapshot caps tool summaries at 50ch.
-    const inner = `<div class="snapshot" style="--cols:${snap.cols}ch">${renderAnsi(snap.ansi, classifier)}</div>`;
+    const inner = `<div class="snapshot" style="--cols:${snap.cols}ch">${renderAnsi(snap.ansi, classifier, mockEmail)}</div>`;
     templates += `<template data-w="${w}" data-cols="${snap.cols}">${inner}</template>\n`;
   }
 

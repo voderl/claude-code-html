@@ -21,6 +21,37 @@ export function cleanAnsi(s: string): string {
     .replace(NON_SGR_CSI_RE, "");
 }
 
+// Email-like run inside a single text segment (no SGR escapes inside the
+// local-part or domain). Claude Code paints the startup banner's email in one
+// colour span, so the SGR-aware split in maskEmails() is enough.
+const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+
+/**
+ * Replace each email with the same number of `*` characters, keeping only the
+ * `@` glyph intact (so `voderlxiao@gmail.com` → `**********@*********`). We
+ * tokenise the ANSI into [text, SGR, text, SGR, …] runs and only mask within
+ * text runs — that way an SGR escape like `\x1b[33m` whose trailing `m` could
+ * otherwise be consumed as a local-part char stays untouched.
+ */
+export function maskEmails(ansi: string): string {
+  let out = "";
+  let last = 0;
+  const re = /\x1b\[[\d;]*[a-zA-Z]/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(ansi)) !== null) {
+    out += maskEmailsInText(ansi.slice(last, m.index)) + m[0];
+    last = m.index + m[0].length;
+  }
+  out += maskEmailsInText(ansi.slice(last));
+  return out;
+}
+
+function maskEmailsInText(s: string): string {
+  return s.replace(EMAIL_RE, (email) =>
+    email.replace(/[^@]/g, "*"),
+  );
+}
+
 function firstVisibleChar(line: string): string {
   const m = line.replace(SGR_RE, "").match(/^\s*(\S)/);
   return m ? m[1] : "";

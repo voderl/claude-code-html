@@ -254,6 +254,10 @@ async function main() {
       "initial fold state: 'preview' (every tool/tool-group <details> collapsed) or 'detail' (everything expanded). URL ?mode=preview|detail overrides this at view time.",
       "preview"
     )
+    .option(
+      "--no-mock-email",
+      "don't mask user emails appearing before the first user turn (banner / account info). By default the banner email is replaced with `*` of the same length, keeping `@`.",
+    )
     .option("--claude <bin>", "claude binary", "claude")
     .option("--cwd <dir>", "working directory for the tmux process (default: $PWD)", pwd)
     .option("--history-limit <n>", "tmux history-limit (lines of scrollback)", "1000000")
@@ -280,6 +284,7 @@ async function main() {
     socket: string;
     debugDir?: string;
     quiet?: boolean;
+    mockEmail: boolean;
   }>();
 
   const tmuxCheck = checkTmuxAvailable();
@@ -349,6 +354,7 @@ async function main() {
     fontPx: parseInt(opts.fontPx, 10),
     title,
     mode,
+    mockEmail: opts.mockEmail,
   });
 
   fs.mkdirSync(path.dirname(outPath), { recursive: true });

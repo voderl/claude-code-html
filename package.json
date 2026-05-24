@@ -11,7 +11,8 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "prepare": "tsc",
-    "start": "node dist/cli.js"
+    "start": "node dist/cli.js",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "ansi_up": "^6.0.2",
