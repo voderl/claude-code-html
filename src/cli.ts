@@ -36,6 +36,32 @@ function sessionName(sessionId: string): string {
   return `ccs_${sessionId.slice(0, 8)}`;
 }
 
+/**
+ * Format the "no session id" error in Claude Code's visual idiom — orange
+ * ✳ marker for the heading and a pink `!` (foreground 256-colour 211, the
+ * same hue Claude Code uses for its bash shortcut) followed by the command
+ * in white. Falls back to plain text on non-TTY stderr (CI logs, piped
+ * output) so escape sequences don't leak.
+ */
+function formatMissingSessionId(): string {
+  const tty = !!process.stderr.isTTY;
+  const sgr = (code: string, text: string) => (tty ? `\x1b[${code}m${text}\x1b[0m` : text);
+  const orange = (s: string) => sgr("38;5;173", s); // closest 256-colour match to Claude's ✳ (#cc785c)
+  const bold = (s: string) => sgr("1", s);
+  const bang = tty
+    ? `\x1b[38;5;211m!\x1b[0m \x1b[38;5;231mclaude-code-share\x1b[0m`
+    : `! claude-code-share`;
+  return [
+    "",
+    `${orange("✳")} ${bold("claude-code-share needs a Claude Code session id.")}`,
+    "",
+    `  Run it in a Claude Code session:`,
+    "",
+    `  ${bang}`,
+    "",
+  ].join("\n");
+}
+
 const ANSI_RE = /\x1b\[[\d;]*[a-zA-Z]/g;
 const STATUS_BAR_RE = /Showing detailed transcript/;
 
@@ -264,9 +290,7 @@ async function main() {
 
   const sessionId = program.args[0] || process.env.CLAUDE_CODE_SESSION_ID;
   if (!sessionId) {
-    console.error(
-      "[claude-code-share] missing session id — pass it as the first argument or set $CLAUDE_CODE_SESSION_ID."
-    );
+    console.error(formatMissingSessionId());
     process.exit(1);
   }
   const outPath = opts.out
