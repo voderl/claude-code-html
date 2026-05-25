@@ -342,26 +342,31 @@ function maskPreConversationEmails(segs: Segment[]): void {
 }
 
 // CJK Unified Ideographs + extensions, Hiragana, Katakana, CJK Symbols and
-// Punctuation, Halfwidth and Fullwidth Forms. Each glyph occupies 2 terminal
-// cells, so in HTML we need to clamp its rendered width to 2ch to keep the
-// table borders (│ ─ etc.) aligned with the ASCII grid.
-const CJK_RUN_RE = /[⺀-⻿　-〿぀-ゟ゠-ヿ㐀-䶿一-鿿豈-﫿︰-﹏＀-￯]+/g;
+// Punctuation, Halfwidth and Fullwidth Forms — plus default-emoji-presentation
+// codepoints (✅ ❌ ⭐ 🎉 …). Each glyph occupies 2 terminal cells, so in HTML
+// we clamp its rendered width to 2ch to keep table borders (│ ─ etc.) aligned
+// with the ASCII grid.
+const CJK_RUN_RE = /[⺀-⻿　-〿぀-ゟ゠-ヿ㐀-䶿一-鿿豈-﫿︰-﹏＀-￯\p{Emoji_Presentation}]+/gu;
 
 /**
  * Walk the ansi_up output, splitting it into HTML tags vs raw text, and wrap
- * each *run* of consecutive CJK code points in a single
- * <span class="cjk" style="width:Nch">…</span>, where N = 2 × char count.
+ * each *run* of consecutive wide code points in a single
+ * <span class="cjk" style="width:Nch">…</span>, where N = 2 × codepoint count.
  * CSS justifies the run's content with text-align: justify +
  * text-justify: inter-character (plus 2px horizontal padding to keep short
  * runs from glueing to the box edges), so every wide glyph still lands inside
  * its 2-cell slot without paying the per-character span overhead.
+ *
+ * Width uses [...run].length (codepoint count) rather than run.length so
+ * astral-plane emoji like 🎉 (one codepoint, two UTF-16 units) get 2ch, not
+ * 4ch. ZWJ-joined emoji sequences are out of scope — those still over-allocate.
  */
 export function wrapCJK(html: string): string {
   return html.replace(/(<[^>]+>)|([^<]+)/g, (_m, tag: string, text: string) => {
     if (tag) return tag;
     return text.replace(
       CJK_RUN_RE,
-      (run) => `<span class="cjk" style="width:${run.length * 2}ch">${run}</span>`,
+      (run) => `<span class="cjk" style="width:${[...run].length * 2}ch">${run}</span>`,
     );
   });
 }
