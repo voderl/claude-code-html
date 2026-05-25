@@ -430,8 +430,14 @@ class StyleClassifier {
  * \x1b[...m...\x1b[0m. After classify(), that shows up as `<span class="X">A</span>
  * <span class="X">B</span>` pairs that round-trip to the same color. Merge any
  * such adjacent pair into `<span class="X">A B</span>`. Iterate until fixed
- * point so chains of N same-class spans collapse into one. Safe: we only merge
- * across separators that contain no tags, so we never absorb nested markup.
+ * point so chains of N same-class spans collapse into one.
+ *
+ * SEP is restricted to whitespace only. The non-tag-but-non-whitespace gap is
+ * the bug case: two same-class spans separated by *content* (plain text, OSC 8
+ * \x01..\x02 markers, …) used to be merged greedily, which sucked the gap
+ * content into the styled span and recoloured it. Whitespace inside the merged
+ * span renders identically — for fg colours it's invisible, for bg colours the
+ * styled background continues across the gap, which is what you'd want.
  *
  * .cjk spans are exempt: their width class encodes the exact CJK char count of
  * the wrapped run, so merging two `class="cjk l"` (width:2ch) spans across an
@@ -439,7 +445,7 @@ class StyleClassifier {
  * content — the cjk box-drawing borders on later lines would then drift.
  */
 function mergeAdjacentSpans(html: string): string {
-  const re = /<span class="([^"]+)">([^<]*)<\/span>([^<]*)<span class="\1">([^<]*)<\/span>/g;
+  const re = /<span class="([^"]+)">([^<]*)<\/span>(\s*)<span class="\1">([^<]*)<\/span>/g;
   let prev = "";
   while (prev !== html) {
     prev = html;
