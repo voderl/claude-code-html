@@ -1,6 +1,56 @@
 import { AnsiUp } from "ansi_up";
 import { cleanAnsi, maskEmails, segmentAnsi, Segment } from "./segment";
 
+/**
+ * Ghostty's built-in 16-color palette (src/terminal/color.zig → Name.default).
+ * We override ansi_up's xterm-ish defaults with this so indexed colors in the
+ * HTML look like what a Ghostty user sees in their terminal. The 256-color
+ * cube (indices 16-231) and grayscale ramp (232-255) use the same xterm
+ * formula as ansi_up, so we only patch the 16 base slots.
+ */
+const GHOSTTY_ANSI_16: { rgb: number[]; class_name: string }[][] = [
+  [
+    { rgb: [0x1d, 0x1f, 0x21], class_name: "ansi-black" },
+    { rgb: [0xcc, 0x66, 0x66], class_name: "ansi-red" },
+    { rgb: [0xb5, 0xbd, 0x68], class_name: "ansi-green" },
+    { rgb: [0xf0, 0xc6, 0x74], class_name: "ansi-yellow" },
+    { rgb: [0x81, 0xa2, 0xbe], class_name: "ansi-blue" },
+    { rgb: [0xb2, 0x94, 0xbb], class_name: "ansi-magenta" },
+    { rgb: [0x8a, 0xbe, 0xb7], class_name: "ansi-cyan" },
+    { rgb: [0xc5, 0xc8, 0xc6], class_name: "ansi-white" },
+  ],
+  [
+    { rgb: [0x66, 0x66, 0x66], class_name: "ansi-bright-black" },
+    { rgb: [0xd5, 0x4e, 0x53], class_name: "ansi-bright-red" },
+    { rgb: [0xb9, 0xca, 0x4a], class_name: "ansi-bright-green" },
+    { rgb: [0xe7, 0xc5, 0x47], class_name: "ansi-bright-yellow" },
+    { rgb: [0x7a, 0xa6, 0xda], class_name: "ansi-bright-blue" },
+    { rgb: [0xc3, 0x97, 0xd8], class_name: "ansi-bright-magenta" },
+    { rgb: [0x70, 0xc0, 0xb1], class_name: "ansi-bright-cyan" },
+    { rgb: [0xea, 0xea, 0xea], class_name: "ansi-bright-white" },
+  ],
+];
+
+const GHOSTTY_BG = "#282C34";
+const GHOSTTY_FG = "#FFFFFF";
+
+/**
+ * ansi_up declares ansi_colors / palette_256 as `private` in its TS surface,
+ * but they're plain runtime properties — replace the 16 base ANSI slots with
+ * Ghostty's defaults, then sync the first 16 entries of palette_256 (which
+ * setup_palettes() seeded from ansi_colors before we got the instance).
+ */
+function applyGhosttyPalette(up: AnsiUp): void {
+  const u = up as unknown as {
+    ansi_colors: typeof GHOSTTY_ANSI_16;
+    palette_256: typeof GHOSTTY_ANSI_16[number];
+  };
+  u.ansi_colors = GHOSTTY_ANSI_16;
+  for (let i = 0; i < 16; i++) {
+    u.palette_256[i] = GHOSTTY_ANSI_16[i >> 3][i & 7];
+  }
+}
+
 export interface Snapshot {
   width: number; // pixel bucket
   cols: number; // tmux column count used at capture
@@ -17,6 +67,7 @@ function ansiChunkToHtml(ansi: string, classifier: StyleClassifier): string {
   if (!ansi) return "";
   const up = new AnsiUp();
   up.use_classes = false;
+  applyGhosttyPalette(up);
   let html = up.ansi_to_html(ansi);
   // Terminal "bold" reads as weight 500-600 visually; browser `bold` (700)
   // looks heavier than what the user sees in their terminal.
@@ -462,9 +513,9 @@ export function buildHtml(opts: BuildHtmlOpts): string {
 <style>
 :root { color-scheme: dark; }
 * { box-sizing: border-box; }
-html, body { margin: 0; padding: 0; background: #181818; }
+html, body { margin: 0; padding: 0; background: ${GHOSTTY_BG}; }
 body {
-  color: #e5e5e5;
+  color: ${GHOSTTY_FG};
   font-family: Menlo, Monaco, "SF Mono", SFMono-Regular, ui-monospace,
                Consolas, "Liberation Mono", "Courier New",
                "PingFang SC", "PingFang TC", "Hiragino Sans GB",

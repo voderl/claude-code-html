@@ -18,7 +18,7 @@ Requires Node ≥ 18 and `tmux` on `PATH`. Open the resulting `.html` in any bro
 
 ## What you get in the HTML
 
-- **Terminal-accurate rendering.** ANSI 16/256/truecolor and bold all preserved. "Bold" is rendered at weight 500 instead of 700 so it matches what your terminal actually shows, not the heavier browser default.
+- **Terminal-accurate rendering.** ANSI 16/256/truecolor and bold all preserved, using [Ghostty](https://ghostty.org/)'s default palette and background so indexed colors look like a real modern terminal instead of stock xterm. "Bold" is rendered at weight 500 instead of 700 so it matches what your terminal actually shows, not the heavier browser default.
 - **Responsive breakpoints.** `--cols 120,80,40` captures the session at three widths; the browser picks the right one for the viewport.
 - **OSC 8 + bare URL hyperlinks.** Cmd-click-style behaviour from the terminal carries over — clickable links open in a new tab.
 - **CJK-aware wrapping.** Wide characters wrap correctly inside the monospace grid.
