@@ -348,6 +348,13 @@ function maskPreConversationEmails(segs: Segment[]): void {
 // with the ASCII grid.
 const CJK_RUN_RE = /[⺀-⻿　-〿぀-ゟ゠-ヿ㐀-䶿一-鿿豈-﫿︰-﹏＀-￯\p{Emoji_Presentation}]+/gu;
 
+// Single-cell glyphs from the Miscellaneous Technical block (U+2300–U+23FF)
+// that Claude Code uses as block markers — ⎿ (tool output) and ⏺ (tool call).
+// They're 1 cell in the terminal, but many monospace fonts render them ~1.1ch
+// wide, which shifts the first line of a tool block right of its wrapped
+// continuations. Clamp them to exactly 1ch so the cell grid stays honest.
+const NARROW_AMBIGUOUS_RE = /[⏺⎿]/g;
+
 /**
  * Walk the ansi_up output, splitting it into HTML tags vs raw text, and wrap
  * each *run* of consecutive wide code points in a single
@@ -360,14 +367,22 @@ const CJK_RUN_RE = /[⺀-⻿　-〿぀-ゟ゠-ヿ㐀-䶿一-鿿豈-﫿︰-﹏＀
  * Width uses [...run].length (codepoint count) rather than run.length so
  * astral-plane emoji like 🎉 (one codepoint, two UTF-16 units) get 2ch, not
  * 4ch. ZWJ-joined emoji sequences are out of scope — those still over-allocate.
+ *
+ * Narrow-ambiguous markers (⎿ ⏺) get clamped to 1ch with padding:0, overriding
+ * the .cjk class's 2px gutters — they each occupy exactly one cell of the grid.
  */
 export function wrapCJK(html: string): string {
   return html.replace(/(<[^>]+>)|([^<]+)/g, (_m, tag: string, text: string) => {
     if (tag) return tag;
-    return text.replace(
+    let out = text.replace(
       CJK_RUN_RE,
       (run) => `<span class="cjk" style="width:${[...run].length * 2}ch">${run}</span>`,
     );
+    out = out.replace(
+      NARROW_AMBIGUOUS_RE,
+      (c) => `<span class="cjk" style="width:1ch;padding:0">${c}</span>`,
+    );
+    return out;
   });
 }
 
