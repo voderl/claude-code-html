@@ -2,19 +2,15 @@
 
 **Share your Claude Code transcripts in web — pixel-for-pixel the same as it looks in your terminal.**
 
-## Install & Usage
+## Usage
+
+Inside a Claude Code session:
 
 ```bash
-npm install -g claude-code-html
+! npx claude-code-html
 ```
 
-Requires Node ≥ 18 and `tmux` on `PATH`. Then, inside a Claude Code session:
-
-```bash
-! claude-code-html
-```
-
-Open the resulting `.html` in any browser. It's a single file — no assets, no JS framework, no network.
+Requires Node ≥ 18 and `tmux` on `PATH`. Open the resulting `.html` in any browser — it's a single file with no assets, no JS framework, and no network.
 
 ## How it works
 
