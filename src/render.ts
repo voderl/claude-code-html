@@ -101,11 +101,22 @@ const SENTENCE_PUNCT = ".,;:!?";
 // `.,;:!?` always come off; `)` / `]` / `}` only come off when they don't
 // balance an opener in the URL itself — so the Wikipedia-style
 // "/wiki/Foo_(bar)" keeps its closing paren but "(see https://x.com)" drops it.
+// Trailing HTML entities other than `&amp;` also come off — they come from
+// the surrounding HTML escaping (e.g. a `"` around the URL becoming `&quot;`),
+// not from the URL itself. `&amp;` stays because it's how `&` in query
+// strings appears post-ansi_up.
+const TRAILING_ENTITY_RE = /&(?!amp;)(?:[a-zA-Z][a-zA-Z0-9]*|#\d+|#x[a-fA-F0-9]+);$/;
 function trimUrlTail(raw: string): { url: string; tail: string } {
   let i = raw.length;
   while (i > 0) {
+    const entity = TRAILING_ENTITY_RE.exec(raw.slice(0, i));
+    if (entity) { i -= entity[0].length; continue; }
     const c = raw[i - 1];
-    if (SENTENCE_PUNCT.indexOf(c) !== -1) { i--; continue; }
+    if (SENTENCE_PUNCT.indexOf(c) !== -1) {
+      // Keep the `;` that terminates a trailing &amp; — it's part of the URL.
+      if (c === ";" && /&amp;$/.test(raw.slice(0, i))) break;
+      i--; continue;
+    }
     if (c === ")" && countChar(raw, ")", i) > countChar(raw, "(", i)) { i--; continue; }
     if (c === "]" && countChar(raw, "]", i) > countChar(raw, "[", i)) { i--; continue; }
     if (c === "}" && countChar(raw, "}", i) > countChar(raw, "{", i)) { i--; continue; }
