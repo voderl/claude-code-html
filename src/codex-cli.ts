@@ -291,6 +291,14 @@ async function captureSnapshots(opts: {
       );
     }
 
+    // Press Esc once before any Ctrl-T toggling. On resume codex can come up
+    // with a transient overlay focused (a popup, the model picker, an
+    // approval prompt, etc.) that swallows Ctrl-T, leaving us on the live UI
+    // and capturing 0 transcript pages. Esc dismisses that overlay so the
+    // subsequent Ctrl-T reliably toggles into the transcript view.
+    opts.tmux.sendKeys(name, "Escape");
+    await waitSettle();
+
     for (let s = 0; s < opts.specs.length; s++) {
       const spec = opts.specs[s];
 

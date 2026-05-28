@@ -1,0 +1,17 @@
+{
+  "name": "codex-html",
+  "version": "0.1.3",
+  "description": "Thin wrapper that runs the `codex-html` command from claude-code-html, so `npx codex-html` resolves on the registry.",
+  "bin": {
+    "codex-html": "bin.js"
+  },
+  "dependencies": {
+    "claude-code-html": "^0.1.3"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "bin.js"
+  ]
+}
