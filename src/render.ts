@@ -253,8 +253,9 @@ export function renderAnsi(
   ansi: string,
   classifier: StyleClassifier,
   mockEmail = true,
+  opts: { codex?: boolean } = {},
 ): string {
-  const segs = segmentAnsi(cleanAnsi(ansi));
+  const segs = segmentAnsi(cleanAnsi(ansi), { codex: opts.codex });
   if (mockEmail) maskPreConversationEmails(segs);
   const parts: string[] = [];
   let promptIdx = 0;
@@ -502,6 +503,10 @@ export interface BuildHtmlOpts {
   // Mask emails appearing before the first user turn (banner, account info)
   // with `*` of equal length, keeping `@` literal. Defaults to true.
   mockEmail?: boolean;
+  // Codex transcript mode: recognise codex's `›` (prompt) and `•` (agent)
+  // markers, and drop the bottom-right Ctrl+O/Ctrl+E hint (no tool-groups
+  // exist in codex output, so the toggles have nothing to act on).
+  codex?: boolean;
 }
 
 /**
@@ -523,6 +528,7 @@ export function buildHtml(opts: BuildHtmlOpts): string {
   // 'detail' = all <details> open. Falls back to 'preview' on any other value.
   const buildMode: "preview" | "detail" = opts.mode === "detail" ? "detail" : "preview";
   const mockEmail = opts.mockEmail !== false;
+  const codex = !!opts.codex;
   let title = (opts.title ?? "").trim().replace(/^✳\s*/, "").trim();
   if (!title) title = `Claude Code Session ${sessionId}`;
 
@@ -536,7 +542,7 @@ export function buildHtml(opts: BuildHtmlOpts): string {
     // Expose the capture's column count as a CSS variable so .tool's
     // ellipsis cap (max-width: var(--cols)) matches the exported pane
     // width — e.g. a 50-col snapshot caps tool summaries at 50ch.
-    const inner = `<div class="snapshot" style="--cols:${snap.cols}ch">${renderAnsi(snap.ansi, classifier, mockEmail)}</div>`;
+    const inner = `<div class="snapshot" data-cols="${snap.cols}" style="--cols:${snap.cols}ch">${renderAnsi(snap.ansi, classifier, mockEmail, { codex })}</div>`;
     templates += `<template data-w="${w}" data-cols="${snap.cols}">${inner}</template>\n`;
   }
 
@@ -546,7 +552,7 @@ export function buildHtml(opts: BuildHtmlOpts): string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(title)}</title>
-<link rel="icon" href="${faviconDataUrl()}">
+<link rel="icon" href="${codex ? codexFaviconDataUrl() : faviconDataUrl()}">
 <style>
 :root { color-scheme: dark; }
 * { box-sizing: border-box; }
@@ -701,13 +707,31 @@ details.tool-group[open] > summary.tool-group-summary { display: none; }
 .ccs-menu-empty {
   padding: 8px 10px; color: #888; font-style: italic;
 }
-${classifier.cssRules()}
+${codex ? `/* Codex's live UI paints the prompt as a slate input box that fills the
+   pane row (background SGR 48;2;65;69;76 + trailing fill). The transcript
+   view drops both, so we rebuild the box in CSS: inline-block sized to the
+   capture's column count lets multi-line prompts wrap inside a single
+   contiguous box, exactly the live-UI look. */
+.user-prompt {
+  display: inline-block;
+  width: var(--cols, 100%);
+  background-color: rgb(65, 69, 76);
+  vertical-align: top;
+  padding: 16px 0px 16px 12px;
+  margin-left: -12px;
+}
+/* Mobile breakpoint: the cols=47 snapshot is sized to fit a phone screen at
+   the default 14px font, but on actual phones (typical viewport ~360–420px)
+   even 47ch overflows. Drop the font to 12px just for that breakpoint so the
+   row fits without horizontal scroll. Other cols keep the default size. */
+.snapshot[data-cols="47"] { font-size: 12px; }
+` : ""}${classifier.cssRules()}
 </style>
 </head>
 <body>
 ${templates}<div id="snap"></div>
 <div class="ccs-menu" id="ccs-menu"><button class="ccs-menu-btn" id="ccs-menu-btn" type="button" aria-label="提问列表">☰</button><div class="ccs-menu-list" id="ccs-menu-list"></div></div>
-<div class="hint" id="ccs-hint"><b id="ccs-idx">${buildMode === "detail" ? "Detail" : "Preview"}</b> · <kbd>Ctrl</kbd>+<kbd>O</kbd> toggle<span id="ccs-tools-hint"${buildMode === "detail" ? "" : " hidden"}> · <kbd>Ctrl</kbd>+<kbd>E</kbd> to <span id="ccs-tools">expand</span> tool</span></div>
+${codex ? "" : `<div class="hint" id="ccs-hint"><b id="ccs-idx">${buildMode === "detail" ? "Detail" : "Preview"}</b> · <kbd>Ctrl</kbd>+<kbd>O</kbd> toggle<span id="ccs-tools-hint"${buildMode === "detail" ? "" : " hidden"}> · <kbd>Ctrl</kbd>+<kbd>E</kbd> to <span id="ccs-tools">expand</span> tool</span></div>`}
 <script>
 (function () {
   var widths = ${JSON.stringify(widths)};
@@ -802,7 +826,7 @@ ${templates}<div id="snap"></div>
       // .user-prompt wraps only the user's question (prompt span) or the
       // bashTool summary — no slash-command output bleeds in, so the label
       // needs no ⎿ slicing. Just strip the leading marker.
-      var label = raw.replace(/^[❯!]\\s*/, '').replace(/\\s+/g, ' ').trim();
+      var label = raw.replace(/^[❯!›]\\s*/, '').replace(/\\s+/g, ' ').trim();
       // Bypass-permissions banner renders as a ❯ block sandwiched between
       // box-drawing rules. Skip entries whose content is purely decorative.
       if (!label || /^─/.test(label)) continue;
@@ -873,6 +897,14 @@ function uniqSorted(xs: number[]): number[] {
 
 function faviconDataUrl(): string {
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><text x="32" y="32" dy=".35em" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="52" fill="#cc785c">✳</text></svg>`;
+  return `data:image/svg+xml,${encodeURIComponent(svg)}`;
+}
+
+// Codex variant: bare `>_` shell-prompt glyph painted in codex's theme
+// gradient (lavender → periwinkle blue). No background tile — the glyph sits
+// directly on whatever the tab/bookmark surface is.
+function codexFaviconDataUrl(): string {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#b5a6f0"/><stop offset="1" stop-color="#8db4f7"/></linearGradient></defs><text x="32" y="34" dy=".35em" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="44" font-weight="700" fill="url(#g)">&gt;_</text></svg>`;
   return `data:image/svg+xml,${encodeURIComponent(svg)}`;
 }
 

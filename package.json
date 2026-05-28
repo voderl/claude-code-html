@@ -1,9 +1,10 @@
 {
   "name": "claude-code-html",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Capture a Claude Code session via tmux and render it as a responsive, self-contained HTML page.",
   "bin": {
-    "claude-code-html": "dist/cli.js"
+    "claude-code-html": "dist/cli.js",
+    "codex-html": "dist/codex-cli.js"
   },
   "main": "dist/cli.js",
   "type": "commonjs",

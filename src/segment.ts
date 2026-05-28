@@ -88,7 +88,7 @@ type BlockKind = "tool" | "prompt" | "bashTool" | "agent";
 // (agent prose gets wrapped in a span, tool calls fold into <details>).
 const AGENT_DOT_RE = /^\x1b\[(?:[\d;]*;)?38;5;231m\x1b\[/;
 
-function detectStart(line: string): BlockKind | "" {
+function detectStart(line: string, codex: boolean): BlockKind | "" {
   if (!SGR_PREFIX_RE.test(line)) return "";
   switch (firstVisibleChar(line)) {
     case "⏺":
@@ -99,6 +99,21 @@ function detectStart(line: string): BlockKind | "" {
       return "prompt";
     case "!":
       return "bashTool";
+    // Codex transcript glyphs: `›` opens a user prompt block and `•` opens
+    // an agent/tool turn. Codex paints `•` for both prose and tool calls
+    // with the same dim SGR, so we don't distinguish — classifying every
+    // `•` line as "agent" just gives us a block boundary that closes the
+    // preceding prompt cleanly, which is what the right-side menu needs.
+    case "›":
+      return codex ? "prompt" : "";
+    case "•":
+      return codex ? "agent" : "";
+    // `■` opens codex's system-error blocks (e.g. "■ Conversation interrupted
+    // - …"). Without recognising it as a starter, the red error line gets
+    // swallowed into whatever block precedes it — usually the user prompt
+    // it follows — and ends up painted with the prompt background.
+    case "■":
+      return codex ? "agent" : "";
     default:
       return "";
   }
@@ -122,7 +137,14 @@ function isOutputArrow(line: string): boolean {
  * implementation needed: leading empty spans, classifier name drift, span
  * boundaries across newlines.
  */
-export function segmentAnsi(ansi: string): Segment[] {
+export interface SegmentOpts {
+  // Recognise codex transcript glyphs (`›` prompt, `•` agent) in addition
+  // to the claude ones. Off by default so claude segmentation is untouched.
+  codex?: boolean;
+}
+
+export function segmentAnsi(ansi: string, opts: SegmentOpts = {}): Segment[] {
+  const codex = !!opts.codex;
   const lines = ansi.split("\n");
   const segs: Segment[] = [];
 
@@ -208,7 +230,7 @@ export function segmentAnsi(ansi: string): Segment[] {
     // suppress the gap that separates it from the next block.
     if (TIMESTAMP_RE.test(line)) continue;
 
-    const starter = detectStart(line);
+    const starter = detectStart(line, codex);
     if (starter) {
       flushBlock();
       flushPlain();

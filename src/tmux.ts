@@ -40,7 +40,7 @@ export class Tmux {
 
   constructor(public readonly socket: string) {}
 
-  private run(args: string[], opts: { check?: boolean; env?: Record<string, string> } = {}): SpawnSyncReturns<string> {
+  private run(args: string[], opts: { check?: boolean; env?: Record<string, string | undefined> } = {}): SpawnSyncReturns<string> {
     const prefix = ["-L", this.socket];
     if (this.configFile) prefix.push("-f", this.configFile);
     const result = spawnSync("tmux", [...prefix, ...args], {
@@ -112,7 +112,7 @@ export class Tmux {
     rows: number;
     cwd?: string;
     command: string[];
-    env?: Record<string, string>;
+    env?: Record<string, string | undefined>;
   }): void {
     const args = [
       "new-session",

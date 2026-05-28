@@ -10,6 +10,8 @@ Inside a Claude Code session:
 ! npx claude-code-html
 ```
 
+> Inside a Codex session, run `! npx codex-html` for the equivalent.
+
 Requires Node ≥ 18 and `tmux` on `PATH`. Open the resulting `.html` in any browser — it's a single file with no assets, no JS framework, and no network.
 
 ## How it works
